@@ -74,3 +74,10 @@ Combine all analyses into a single report:
 2. Run loudnorm for LUFS measurement
 3. Run librosa for BPM + key (if available)
 4. Present as structured summary
+
+## Listening Report (vocals)
+
+To check what a generated vocal actually contains (sung words, pitch and
+register, level against the backing, timing, a spectrogram), use
+`scripts/music_listen.sh` from the main skill. See "Listening to a Result" in
+`skills/claude-music/SKILL.md` for the command and how to read the JSON.

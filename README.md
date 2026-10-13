@@ -236,7 +236,7 @@ Removes skill links only. Your generated music and ACE-Step are untouched.
 
 ```bash
 pip install -e ".[dev]"
-pytest tests/            # 74 contract tests, ~1s, no GPU required
+pytest tests/            # 83 contract tests, ~1s, no GPU required
 ruff check skills/ tests/
 ```
 

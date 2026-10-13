@@ -124,10 +124,39 @@ bash ~/.claude/skills/claude-music/scripts/music_engine.sh --quality standard --
 
 - **Analyze first** (`/music analyze`): pass the source's real `--bpm` and `--key`, and lay the lyric sections out against its energy curve.
 - **`--track`** is one of vocals, backing_vocals, drums, bass, guitar, keyboard, percussion, strings, synth, fx, brass, woodwinds. Without it the model guesses which layer to add.
+- **`--start` / `--end`** (seconds) limit where the layer plays, e.g. `--start 29.8` to bring vocals in after a 16-bar intro at 129 BPM. Snap them to bar lines: one bar is `240 / bpm` seconds in 4/4. Outside that range the layer file contains the source audio, not silence; `--mix` mutes it there, and a manual mix must do the same.
+- **Listen afterwards**: run `music_listen.sh` on the layer (next section) and report what it finds.
 - **The output is the new layer alone**, not the full song. `--mix` also writes `<name>_mix.<ext>` (source + layer, limiter on top) and reports it as `mix_path`. Rebalance with `--mix-gain <dB>` or by re-mixing the stem with ffmpeg; that needs no new generation.
 - **Needs the base model**: `cd <ace_step_dir> && uv run acestep-download --model acestep-v15-base --skip-main` (~4.8 GB). `--quality standard` keeps the LM unloaded, which matters on 16 GB machines; the engine still switches to the base model and its step/guidance settings.
 - **It is slow**: about 15 s per step for a 3-minute track on Apple Silicon (16 GB), so ~19 min at 50 steps. Run it in the background and tell the user up front. The engine raises ACE-Step's 600 s generation timeout to an hour (`ACESTEP_GENERATION_TIMEOUT` overrides).
 - **Progress**: with `--progress`, stderr carries `{"event": "step", "step": 11, "total": 50, "eta_sec": 547}` lines from the real diffusion loop. Report those.
+
+## Listening to a Result (music_listen)
+
+Claude cannot hear audio. After generating a vocal, run the listening report and
+read it before describing the result or asking the user how it sounds:
+
+```bash
+bash ~/.claude/skills/claude-music/scripts/music_listen.sh "$LAYER" \
+  --source "$SRC" --lyrics lyrics.txt --language en \
+  --key "C minor" --bpm 129 --start 29.8 --mix-gain -3 --spectrogram auto
+```
+
+Pass the same `--start`, `--end` and `--mix-gain` as the lego run. The JSON reports:
+
+| Field | Answers |
+|-------|---------|
+| `transcript`, `lyrics` | What is actually sung and when; which expected lines are missing or garbled; the language Whisper heard |
+| `activity` | First onset, phrases, and silences of 4 s or more (`gaps`) |
+| `pitch` | Median pitch, range, register (bass to soprano), share of notes in the key |
+| `balance` | Voice against backing in dB per 10 s window, and how much that varies |
+| `timing` | How far phrase starts land from the nearest eighth note |
+| `spectrogram` | Path to a PNG; open it with Read to look for dropouts and noise |
+
+- **Report facts, then ask about taste.** "Line 2 of verse 2 is missing, the voice sits around A2, it drops out 80-100 s" is yours to say. Whether it sounds good is the user's.
+- **Best on a lego layer**, where the voice is isolated. On a full mix the transcript still works but pitch and balance mean little.
+- **Whisper mishears singing.** A low `match` on one line is a hint, not proof; several in a row, or a wrong `language`, is a real finding.
+- The first run downloads the Whisper model (~1.6 GB). The report takes 1-2 min for a 3-minute track. `--no-transcribe` skips Whisper.
 
 ## Quality Presets
 
@@ -205,6 +234,7 @@ The wrapper handles: path setup, environment variables, VRAM pre-check, `uv run`
 | `scripts/music_engine.py` | Core ACE-Step Python API wrapper (all 6 task types) |
 | `scripts/music_engine.sh` | Bash wrapper (env, VRAM, `uv run`, show-once star nudge) |
 | `scripts/music_export.sh` | FFmpeg platform export commands |
+| `scripts/music_listen.sh` / `.py` | Listening report: transcript, pitch, balance, timing, spectrogram → JSON |
 | `scripts/rank.py` | Batch-rank outputs vs caption (stub — Theme 3 of research plan) |
 | `scripts/detect_gpu.sh` | GPU detection (NVIDIA or Apple Silicon) + tier recommendation → JSON |
 | `scripts/preflight.sh` | Safety checks for audio files → JSON |

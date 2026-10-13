@@ -544,15 +544,24 @@ def task_instruction(task, track=None):
     return named.format(track=track.upper()) if track else default
 
 
-def build_mix_command(src_audio, layer, out_path, layer_gain_db=0.0):
+def build_mix_command(src_audio, layer, out_path, layer_gain_db=0.0,
+                      start=0.0, end=-1.0):
     """ffmpeg argv that lays a generated layer over the untouched source.
 
     Both inputs drop 3 dB before summing and a limiter catches what is left,
     so the mix cannot clip. -n keeps the no-overwrite guarantee.
+
+    Outside --start/--end ACE-Step returns the source itself, not silence, so
+    the layer is faded to nothing there or the source would be doubled.
     """
+    fades = ""
+    if start and start > 0:
+        fades += f",afade=t=in:st={max(0.0, start - 0.05):.2f}:d=0.05"
+    if end and end > 0:
+        fades += f",afade=t=out:st={end:.2f}:d=0.05"
     graph = (
         "[0:a]aresample=48000,volume=-3dB[src];"
-        f"[1:a]aresample=48000,volume={layer_gain_db - 3.0:.1f}dB[layer];"
+        f"[1:a]aresample=48000,volume={layer_gain_db - 3.0:.1f}dB{fades}[layer];"
         "[src][layer]amix=inputs=2:normalize=0:duration=first,"
         "alimiter=limit=0.89:level=false[mix]"
     )
@@ -560,7 +569,7 @@ def build_mix_command(src_audio, layer, out_path, layer_gain_db=0.0):
             "-filter_complex", graph, "-map", "[mix]", out_path]
 
 
-def mix_with_source(src_audio, layer, layer_gain_db=0.0):
+def mix_with_source(src_audio, layer, layer_gain_db=0.0, start=0.0, end=-1.0):
     """Mix a lego layer with its source. Returns the mix path, or None."""
     if not shutil.which("ffmpeg"):
         log("Warning: ffmpeg not found, skipping --mix")
@@ -572,7 +581,8 @@ def mix_with_source(src_audio, layer, layer_gain_db=0.0):
         out_path = f"{stem}_mix-{counter}{ext}"
         counter += 1
     try:
-        subprocess.run(build_mix_command(src_audio, layer, out_path, layer_gain_db),
+        subprocess.run(build_mix_command(src_audio, layer, out_path, layer_gain_db,
+                                         start, end),
                        check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
                        text=True)
     except (OSError, subprocess.CalledProcessError) as e:
@@ -1106,6 +1116,8 @@ def cmd_lego(args):
         task_type="lego",
         instruction=task_instruction("lego", args.track),
         src_audio=args.src_audio,
+        repainting_start=args.start,
+        repainting_end=args.end,
         inference_steps=args.inference_steps,
         guidance_scale=args.guidance_scale,
         seed=args.seed,
@@ -1149,7 +1161,8 @@ def cmd_lego(args):
     # lego returns the new layer alone, not the source with the layer on top
     if args.mix:
         for out in outputs:
-            mix_path = mix_with_source(args.src_audio, out["path"], args.mix_gain)
+            mix_path = mix_with_source(args.src_audio, out["path"], args.mix_gain,
+                                       args.start, args.end)
             if mix_path:
                 out["mix_path"] = mix_path
 
@@ -1377,6 +1390,10 @@ def build_parser():
     p_lego.add_argument("--lyrics", "-l", default="")
     p_lego.add_argument("--track", choices=TRACK_NAMES, default=None,
                         help="Which layer to add (e.g. vocals, drums, bass)")
+    p_lego.add_argument("--start", type=float, default=0.0,
+                        help="Where the new layer begins (seconds)")
+    p_lego.add_argument("--end", type=float, default=-1.0,
+                        help="Where the new layer ends (seconds, -1=end of file)")
     p_lego.add_argument("--mix", action="store_true",
                         help="Also write the layer mixed over the source (<name>_mix)")
     p_lego.add_argument("--mix-gain", type=float, default=0.0,

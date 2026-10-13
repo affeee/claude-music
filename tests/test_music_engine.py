@@ -439,6 +439,10 @@ def test_lego_passes_instruction_and_language(engine_source):
     args = music_engine.build_parser().parse_args(parser_args)
     assert (args.track, args.language, args.bpm, args.key, args.mix) == (
         "vocals", "sv", 129, "C minor", True)
+    assert (args.start, args.end) == (0.0, -1.0)
+    late = music_engine.build_parser().parse_args([*parser_args, "--start", "29.8"])
+    assert late.start == 29.8
+    assert "repainting_start=args.start" in engine_source
 
 
 def test_generation_timeout_is_raised(engine_source):
@@ -453,6 +457,16 @@ def test_mix_command_never_overwrites_or_touches_source(engine_module):
     graph = cmd[cmd.index("-filter_complex") + 1]
     assert "volume=-5.0dB[layer]" in graph
     assert "alimiter" in graph
+    assert "afade" not in graph
+
+
+def test_mix_mutes_the_layer_outside_its_region(engine_module):
+    """Outside --start/--end the lego output is the source audio (measured:
+    correlation 1.0), so mixing it unmuted doubles the source there."""
+    cmd = engine_module.build_mix_command("s.mp3", "l.flac", "o.flac", 0.0, 29.8, 150.0)
+    graph = cmd[cmd.index("-filter_complex") + 1]
+    assert "afade=t=in:st=29.75:d=0.05" in graph
+    assert "afade=t=out:st=150.00:d=0.05" in graph
 
 
 def test_mix_with_source_writes_beside_layer(engine_module, tmp_path):
@@ -588,3 +602,97 @@ def test_lm_that_does_not_fit_unified_memory_is_replaced_or_skipped(engine_modul
 def test_lm_backend_is_mlx_on_apple_silicon(engine_module):
     assert engine_module.lm_backend(MAC_16) == "mlx"
     assert engine_module.lm_backend(NVIDIA) == "vllm"
+
+
+# ---------------------------------------------------------------------------
+# (i) Listening report (music_listen.py) — pure helpers, no audio libraries
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(scope="session")
+def listen(_scripts_importable):
+    import music_listen
+    return music_listen
+
+
+def test_parse_key(listen):
+    assert listen.parse_key("C minor") == {0, 2, 3, 5, 7, 8, 10}
+    assert listen.parse_key("Am") == {9, 11, 0, 2, 4, 5, 7}
+    assert listen.parse_key("Bb major") == {10, 0, 2, 3, 5, 7, 9}
+    assert listen.parse_key("") is None and listen.parse_key("H dur") is None
+
+
+def test_pitch_summary_reads_register_and_key(listen):
+    c3, eb3, g3 = 130.81, 155.56, 196.0
+    low = listen.pitch_summary([c3, eb3, g3, eb3, c3], listen.parse_key("C minor"))
+    assert low["register"] == "baritone" and low["typical_range"] == "male"
+    assert low["median_note"] == "D#3"
+    assert low["in_key_ratio"] == 1.0
+    assert low["mean_cents_off_semitone"] < 5
+    e3 = 164.81  # E natural is outside C minor
+    assert listen.pitch_summary([e3, e3, c3, c3], listen.parse_key("C minor"))["in_key_ratio"] == 0.5
+    assert listen.pitch_summary([440.0])["typical_range"] == "female"
+    f4 = listen.pitch_summary([349.2])
+    assert (f4["register"], f4["typical_range"]) == ("alto", "female")
+    assert listen.pitch_summary([233.1])["typical_range"] == "high male or low female"
+    assert listen.pitch_summary([0, float("nan")]) is None
+
+
+def test_active_regions_bridge_breaths_and_report_gaps(listen):
+    # 0.1s frames: 1s sung, 0.2s breath, 1s sung, 6s silence, 1s sung, one blip
+    flags = [True] * 10 + [False] * 2 + [True] * 10 + [False] * 60 + [True] * 10 + [False] * 20 + [True]
+    regions = listen.active_regions(flags, 0.1, offset=30.0)
+    assert regions == [(30.0, 32.2), (38.2, 39.2)]
+    assert listen.find_gaps(regions) == [{"start": 32.2, "end": 38.2, "sec": 6.0}]
+
+
+def test_lyric_lines_drop_section_tags(listen):
+    assert listen.lyric_lines("[Verse 1]\nHello there\n\n[Chorus]\nBoo, boo\n") == [
+        "Hello there", "Boo, boo"]
+
+
+def test_match_lyrics_finds_lines_in_order_and_flags_missing(listen):
+    def words(text, t0):
+        return [{"word": w, "start": t0 + i, "end": t0 + i + 0.5}
+                for i, w in enumerate(text.split())]
+
+    heard = (words("the stairs are creaking while the city sleeps", 30)
+             + words("boo you don't scare me", 60)
+             + words("boo you dont scare me", 120))
+    lines = ["The stairs are creaking while the city sleeps",
+             "A light in your window that never goes out",
+             "Boo, you don't scare me",
+             "Boo, you don't scare me"]
+    got = listen.match_lyrics(lines, heard)
+    assert [m["found"] for m in got] == [True, False, True, True]
+    assert got[0]["at"] == 30 and got[2]["at"] == 60
+    assert got[3]["at"] == 120, "the repeated chorus matches its own occurrence"
+
+
+def test_match_lyrics_prefers_the_earliest_good_match(listen):
+    """Regression: 'Ooh, you don't scare me' at 60s lost to a clean repeat at
+    130s, and the whole second verse was reported missing."""
+    def words(text, t0):
+        return [{"word": w, "start": t0 + i, "end": t0 + i + 0.5}
+                for i, w in enumerate(text.split())]
+
+    heard = (words("ooh you don't scare me", 60)
+             + words("we run down shirts where the apples lay", 100)
+             + words("boo you don't scare me", 130))
+    got = listen.match_lyrics(
+        ["Boo, you don't scare me", "We run down streets where the shadows play",
+         "Boo, you don't scare me"], heard)
+    assert [m["at"] for m in got] == [60, 100, 130]
+
+
+def test_beat_offsets_use_eighth_notes(listen):
+    beats = [0.0, 0.5, 1.0, 1.5]
+    assert listen.beat_offsets_ms([0.51, 0.75, 1.02], beats) == [10, 0, 20]
+    assert listen.beat_offsets_ms([0.3], [0.0]) == []
+
+
+def test_listen_has_no_heavy_imports_at_module_level(scripts_dir):
+    """The helpers above must import without numpy/librosa (CI has neither)."""
+    tree = ast.parse((scripts_dir / "music_listen.py").read_text())
+    top = {n.names[0].name.split(".")[0] for n in tree.body if isinstance(n, ast.Import)}
+    top |= {n.module.split(".")[0] for n in tree.body if isinstance(n, ast.ImportFrom)}
+    assert not top & {"numpy", "librosa", "matplotlib", "soundfile", "mlx_whisper"}

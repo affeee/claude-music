@@ -46,6 +46,7 @@ claude-music/
 | `skills/claude-music/scripts/music_web.sh` | Dashboard launcher (starts server, opens browser) |
 | `skills/claude-music/scripts/music_engine.sh` | Bash wrapper — env setup, VRAM check, `uv run` invocation |
 | `skills/claude-music/scripts/music_export.sh` | FFmpeg platform export (Spotify/YouTube/TikTok/podcast/CD) |
+| `skills/claude-music/scripts/music_listen.py` | Listening report (Whisper transcript, pitch, balance, timing, spectrogram). Runs via `music_listen.sh` in a throwaway `uv run --with` env, never inside the ACE-Step venv. Module-level imports stay stdlib-only so the pure helpers are testable in CI |
 | `skills/claude-music/config.json` | ACE-Step path + generation defaults (per-machine, untracked; seeded from `config.example.json` by the installers) |
 | `skills/claude-music/SKILL.md` | Orchestrator — routes `/music X` to sub-skills |
 
