@@ -52,6 +52,10 @@
 | `repainting_start` | float | 0.0 | Repaint region start (seconds) |
 | `repainting_end` | float | -1.0 | Repaint region end (-1 = end of file) |
 
+**Memory flags**: `--offload auto|on|off` (global) decides whether idle models move to CPU. `auto` follows `offload_to_cpu` / `offload_dit_to_cpu` in `config.json` when they are `true`/`false`; otherwise it is on for discrete GPUs and chosen per job on unified memory. See `references/apple-silicon.md`.
+
+**Base-model tasks (extract/lego/complete)**: ACE-Step picks the track from the `instruction` text ("Generate the VOCALS track based on the audio context:"), and the Python API does not derive it from `task_type`. `music_engine.py` builds it from `--track` via `task_instruction()`. When one of these tasks switches a turbo preset to the base model, unset steps/guidance/shift come from the `max` preset. `lego` returns only the generated layer; `--mix` lays it over the source with ffmpeg.
+
 **Cover-mode note**: the ACE-Step demo `examples/generate_saxobeat_cover_spanish.py` uses `src_audio=SOURCE_AUDIO` and `cover_noise_strength=0.5`. Earlier versions of this doc and of `music_engine.py` used `reference_audio` and `audio_cover_strength` — those names are stale/deprecated. Tests in `tests/test_music_engine.py` guard against regression.
 
 ### LM (5Hz Language Model) Control

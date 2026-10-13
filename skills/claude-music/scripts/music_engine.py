@@ -21,7 +21,10 @@ import argparse
 import contextlib
 import json
 import os
+import platform
 import re
+import shutil
+import subprocess
 import sys
 import time
 import traceback
@@ -104,6 +107,67 @@ def emit_event(event, **fields):
         print(json.dumps({"event": event, **fields}), file=sys.stderr, flush=True)
 
 
+# ACE-Step reports the diffusion phase as this slice of its 0..1 progress, and
+# fills it from a wall-clock guess (5s/step until it has timing history). On a
+# slow backend that guess runs minutes ahead of the real step counter.
+DIFFUSION_PCT_RANGE = (0.52, 0.79)
+_diffusion = {"step": 0, "total": 0}
+
+
+def diffusion_pct(pct):
+    """Replace ACE-Step's time-based diffusion estimate with real steps."""
+    start, end = DIFFUSION_PCT_RANGE
+    if pct is None or not start <= pct < end:
+        return pct
+    total = _diffusion["total"]
+    done = _diffusion["step"] / total if total else 0.0
+    return round(start + (end - start) * done, 4)
+
+
+def track_diffusion_steps():
+    """Turn tqdm's diffusion bar into NDJSON 'step' events (--progress only).
+
+    Bars are silenced so they cannot glue themselves to the front of a JSON
+    line, which made line-based readers drop the event.
+    """
+    try:
+        from tqdm.std import tqdm
+    except Exception:
+        return
+    if getattr(tqdm, "_claude_music_patched", False):
+        return
+    orig_init, orig_iter = tqdm.__init__, tqdm.__iter__
+
+    def _init(self, *a, **kw):
+        desc = kw.get("desc") or (a[1] if len(a) > 1 else "") or ""
+        total = kw.get("total") or (a[2] if len(a) > 2 else None)
+        iterable = kw.get("iterable", a[0] if a else None)
+        if total is None:
+            with contextlib.suppress(Exception):
+                total = len(iterable)
+        self._cm_steps = int(total or 0) if "diffusion" in str(desc).lower() else 0
+        kw["disable"] = True
+        orig_init(self, *a, **kw)
+
+    def _iter(self):
+        total = getattr(self, "_cm_steps", 0)
+        if not total:
+            yield from orig_iter(self)
+            return
+        _diffusion.update(step=0, total=total)
+        t0 = time.time()
+        for step, item in enumerate(orig_iter(self), start=1):
+            yield item
+            per_step = (time.time() - t0) / step
+            _diffusion["step"] = step
+            emit_event("step", step=step, total=total,
+                       sec_per_step=round(per_step, 2),
+                       eta_sec=round(per_step * (total - step)))
+
+    tqdm.__init__, tqdm.__iter__ = _init, _iter
+    tqdm._claude_music_patched = True
+
+
 def make_progress(args):
     """Return a Gradio-style progress callable for generate_music(), or None.
 
@@ -112,13 +176,18 @@ def make_progress(args):
     """
     if not getattr(args, "progress", False):
         return None
+    last = {}
 
     def _progress(frac=None, desc=None, *a, **kw):
         try:
             pct = float(frac) if frac is not None else None
         except (TypeError, ValueError):
             pct = None
-        emit_event("progress", pct=pct, stage=str(desc) if desc else "")
+        event = {"pct": diffusion_pct(pct), "stage": str(desc) if desc else ""}
+        if event != last:  # the estimator ticks twice a second
+            last.clear()
+            last.update(event)
+            emit_event("progress", **event)
 
     return _progress
 
@@ -281,15 +350,235 @@ def resolve_quality(args):
         args.guidance_scale = preset["guidance_scale"]
     if args.batch is None:
         # config.json calls this batch_size; the CLI flag is --batch
-        args.batch = (defaults["batch_size"]
-                      if defaults.get("batch_size") is not None
-                      else preset["batch_size"])
+        if defaults.get("batch_size") is not None:
+            args.batch = defaults["batch_size"]
+        else:
+            args.batch = preset["batch_size"]
+            args._batch_from_preset = True
     if args.shift is None:
         args.shift = preset["shift"]
     if not hasattr(args, "thinking") or args.thinking is None:
         args.thinking = pick(None, "thinking")
 
+    return apply_memory_policy(args)
+
+
+def machine_profile():
+    """Memory layout of this machine, without importing torch.
+
+    Apple Silicon shares one pool between CPU and GPU, so the VRAM tiers the
+    presets were tuned for (a 16GB card next to system RAM) do not apply.
+    """
+    memory_gb = 0.0
+    with contextlib.suppress(Exception):
+        memory_gb = os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE") / 1024 ** 3
+    unified = platform.system() == "Darwin" and platform.machine() == "arm64"
+    return {"unified_memory": unified, "memory_gb": round(memory_gb, 1)}
+
+
+def source_duration(path):
+    """Length of an audio file in seconds via ffprobe, or None."""
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "csv=p=0", path],
+            check=True, capture_output=True, text=True, timeout=30).stdout
+        return float(out.strip())
+    except Exception:
+        return None
+
+
+# Seconds of audio (batch x duration) a 16GB unified-memory machine holds with
+# every model resident, i.e. without CPU offload. Measured on an M1/16GB with
+# a 182s track: one variant fits, two run out of MPS memory. Scales with RAM.
+# The runs behind this are in references/apple-silicon.md.
+UNIFIED_AUDIO_BUDGET_SEC = 240.0
+
+
+def unified_audio_budget(profile):
+    return UNIFIED_AUDIO_BUDGET_SEC * profile["memory_gb"] / 16.0
+
+
+def memory_safe_batch(batch, duration, profile=None):
+    """Cap a preset's batch so batch x duration fits unified memory."""
+    profile = profile or machine_profile()
+    if not profile["unified_memory"] or not profile["memory_gb"]:
+        return batch
+    if not duration or duration <= 0:
+        return 1  # unknown length: assume a full track
+    return max(1, min(batch, int(unified_audio_budget(profile) // duration)))
+
+
+def lm_backend(profile=None):
+    """LM backend to ask ACE-Step for. vllm needs CUDA; on Apple Silicon the
+    native MLX backend is what ACE-Step itself recommends, and the PyTorch
+    one ran a 16GB machine out of memory."""
+    profile = profile or machine_profile()
+    return "mlx" if profile["unified_memory"] else "vllm"
+
+
+def fit_lm_to_memory(lm_model, allowed, installed, profile=None):
+    """LM that fits this machine: (model or None, note for the log).
+
+    `allowed` is ACE-Step's own list for the detected memory tier. Only
+    unified memory is held to it: there the 1.7B LM ran a 16GB machine out of
+    memory in every configuration tried, where a 16GB card runs it fine.
+    """
+    profile = profile or machine_profile()
+    if not lm_model or not profile["unified_memory"] or not allowed:
+        return lm_model, ""
+    if lm_model in allowed:
+        return lm_model, ""
+    for candidate in allowed:
+        if candidate in installed:
+            return candidate, (f"{lm_model} does not fit {profile['memory_gb']:.0f} GB "
+                               f"unified memory, using {candidate}")
+    return None, (f"{lm_model} does not fit {profile['memory_gb']:.0f} GB unified memory; "
+                  f"continuing without thinking mode. ACE-Step suggests {allowed[0]} here: "
+                  f"uv run acestep-download --model {allowed[0]} --skip-main")
+
+
+def lm_models_for_this_machine():
+    """ACE-Step's LM list for the detected memory tier, or [] if unknown."""
+    try:
+        from acestep.gpu_config import get_gpu_config
+        return list(get_gpu_config().available_lm_models or [])
+    except Exception:
+        return []
+
+
+def task_uses_lm(args):
+    """ACE-Step ignores the LM for these tasks, so loading it only costs memory."""
+    return getattr(args, "command", None) not in ("cover", "repaint", "extract")
+
+
+def wants_lm(args):
+    return bool(args.lm_model and args.thinking and task_uses_lm(args))
+
+
+def apply_memory_policy(args):
+    """Shrink a preset-chosen batch on unified-memory machines.
+
+    An explicit --batch or config.json batch_size is left alone.
+    """
+    duration = getattr(args, "duration", None)
+    if (not duration or duration <= 0) and getattr(args, "src_audio", None):
+        duration = source_duration(args.src_audio)
+    args._duration_sec = duration
+    if not getattr(args, "_batch_from_preset", False):
+        return args
+    safe = memory_safe_batch(args.batch, duration)
+    if safe < args.batch:
+        log(f"Batch {args.batch} -> {safe}: unified memory "
+            f"({machine_profile()['memory_gb']:.0f} GB). Pass --batch to override.")
+        args.batch = safe
     return args
+
+
+def auto_offload(args, profile=None):
+    """Whether idle models should be moved to CPU when nobody chose.
+
+    A discrete GPU has its own memory, so offloading frees VRAM. On unified
+    memory it only shuffles within one pool and costs about a quarter of the
+    run, so it stays off until the job holds more audio than fits with
+    everything loaded.
+    """
+    profile = profile or machine_profile()
+    if not profile["unified_memory"] or not profile["memory_gb"]:
+        return True
+    duration = getattr(args, "_duration_sec", None)
+    if not duration or duration <= 0:
+        return (args.batch or 1) > 1
+    return (args.batch or 1) * duration > unified_audio_budget(profile)
+
+
+def resolve_offload(args, defaults, key):
+    """CLI --offload > a true/false in config.json > auto_offload()."""
+    choice = getattr(args, "offload", None) or "auto"
+    if choice != "auto":
+        return choice == "on"
+    value = defaults.get(key)
+    if isinstance(value, bool):
+        return value
+    return auto_offload(args)
+
+
+def resolve_base_quality(args, task):
+    """resolve_quality() for the base-model-only tasks (extract/lego/complete).
+
+    These switch a turbo preset to the base model. Turbo's 8 steps / no CFG
+    would starve it, so whatever the CLI left unset comes from the max preset.
+    """
+    cli = {k: getattr(args, k, None)
+           for k in ("inference_steps", "guidance_scale", "shift")}
+    args = resolve_quality(args)
+    if "turbo" in (args.model or ""):
+        args.model = QUALITY_PRESETS["max"]["model"]
+        for key, value in cli.items():
+            if value is None:
+                setattr(args, key, QUALITY_PRESETS["max"][key])
+        log(f"Switched to base model ({task} requires base)")
+    return args
+
+
+TRACK_NAMES = (
+    "vocals", "backing_vocals", "drums", "bass", "guitar", "keyboard",
+    "percussion", "strings", "synth", "fx", "brass", "woodwinds",
+)
+
+# Mirrors acestep.constants.TASK_INSTRUCTIONS. ACE-Step picks the track from
+# the instruction text, and the Python API does not derive it from task_type.
+TASK_INSTRUCTIONS = {
+    "extract": ("Extract the {track} track from the audio:",
+                "Extract the track from the audio:"),
+    "lego": ("Generate the {track} track based on the audio context:",
+             "Generate the track based on the audio context:"),
+    "complete": ("Complete the input track with {track}:",
+                 "Complete the input track:"),
+}
+
+
+def task_instruction(task, track=None):
+    """Instruction prompt for a base-model task, naming the track if given."""
+    named, default = TASK_INSTRUCTIONS[task]
+    return named.format(track=track.upper()) if track else default
+
+
+def build_mix_command(src_audio, layer, out_path, layer_gain_db=0.0):
+    """ffmpeg argv that lays a generated layer over the untouched source.
+
+    Both inputs drop 3 dB before summing and a limiter catches what is left,
+    so the mix cannot clip. -n keeps the no-overwrite guarantee.
+    """
+    graph = (
+        "[0:a]aresample=48000,volume=-3dB[src];"
+        f"[1:a]aresample=48000,volume={layer_gain_db - 3.0:.1f}dB[layer];"
+        "[src][layer]amix=inputs=2:normalize=0:duration=first,"
+        "alimiter=limit=0.89:level=false[mix]"
+    )
+    return ["ffmpeg", "-n", "-v", "error", "-i", src_audio, "-i", layer,
+            "-filter_complex", graph, "-map", "[mix]", out_path]
+
+
+def mix_with_source(src_audio, layer, layer_gain_db=0.0):
+    """Mix a lego layer with its source. Returns the mix path, or None."""
+    if not shutil.which("ffmpeg"):
+        log("Warning: ffmpeg not found, skipping --mix")
+        return None
+    stem, ext = os.path.splitext(layer)
+    out_path = f"{stem}_mix{ext}"
+    counter = 2
+    while os.path.exists(out_path):
+        out_path = f"{stem}_mix-{counter}{ext}"
+        counter += 1
+    try:
+        subprocess.run(build_mix_command(src_audio, layer, out_path, layer_gain_db),
+                       check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                       text=True)
+    except (OSError, subprocess.CalledProcessError) as e:
+        log(f"Warning: mix failed ({getattr(e, 'stderr', '') or e}), keeping the layer only")
+        return None
+    return out_path
 
 
 # ---------------------------------------------------------------------------
@@ -303,9 +592,13 @@ def initialize_acestep(args):
 
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
     os.environ["TORCHAUDIO_USE_BACKEND"] = "ffmpeg"
+    # ACE-Step aborts a generation after 600s, model load included. The base
+    # model on a full-length track needs longer than that off a big GPU.
+    os.environ.setdefault("ACESTEP_GENERATION_TIMEOUT", "3600")
 
     from acestep.handler import AceStepHandler
     if getattr(args, "progress", False):
+        track_diffusion_steps()
         emit_event("stage", stage="loading_model")
     log(f"Loading DiT model: {args.model}...")
 
@@ -313,8 +606,9 @@ def initialize_acestep(args):
     # keep CPU offload on while larger cards can turn it off for speed.
     defaults = getattr(args, "_config_defaults", None) or {}
     use_flash = config_default(defaults, "use_flash_attention", True)
-    offload = config_default(defaults, "offload_to_cpu", True)
-    offload_dit = config_default(defaults, "offload_dit_to_cpu", True)
+    offload = resolve_offload(args, defaults, "offload_to_cpu")
+    offload_dit = resolve_offload(args, defaults, "offload_dit_to_cpu")
+    log(f"CPU offload: {'on' if offload else 'off'}")
 
     handler = AceStepHandler()
     t0 = time.time()
@@ -334,26 +628,36 @@ def initialize_acestep(args):
     log(f"DiT ready in {load_time:.1f}s: {status}")
 
     llm_handler = None
-    if args.lm_model and args.thinking:
+    if args.lm_model and args.thinking and not task_uses_lm(args):
+        log(f"Skipping LM: ACE-Step does not use it for {args.command}")
+    elif wants_lm(args):
+        checkpoints = project_root / "checkpoints"
+        installed = [d.name for d in checkpoints.iterdir()] if checkpoints.is_dir() else []
+        args.lm_model, note = fit_lm_to_memory(
+            args.lm_model, lm_models_for_this_machine(), installed)
+        if note:
+            log(f"Warning: {note}")
+    if wants_lm(args):
         log(f"Loading LM: {args.lm_model}...")
         t1 = time.time()
         try:
             from acestep.llm_inference import LLMHandler
             llm_handler = LLMHandler()
 
-            # Try vllm first, fall back to PyTorch native
-            backend = "vllm"
-            try:
-                import vllm  # noqa: F401
-            except ImportError:
-                backend = "pt"
-                log("vllm not available, using PyTorch backend for LM")
+            backend = lm_backend()
+            if backend == "vllm":
+                # Try vllm first, fall back to PyTorch native
+                try:
+                    import vllm  # noqa: F401
+                except ImportError:
+                    backend = "pt"
+                    log("vllm not available, using PyTorch backend for LM")
 
             lm_status, lm_success = llm_handler.initialize(
                 checkpoint_dir=str(project_root / "checkpoints"),
                 lm_model_path=args.lm_model,
                 backend=backend,
-                device="cuda",
+                device="auto",
                 offload_to_cpu=offload,
             )
             if not lm_success:
@@ -707,10 +1011,7 @@ def cmd_repaint(args):
 
 def cmd_extract(args):
     """Track separation (base model only)."""
-    args = resolve_quality(args)
-    if "turbo" in (args.model or ""):
-        args.model = "acestep-v15-base"
-        log("Switched to base model (extract requires base)")
+    args = resolve_base_quality(args, "extract")
 
     if not args.src_audio:
         error_json("Must provide --src-audio for extract mode")
@@ -726,10 +1027,12 @@ def cmd_extract(args):
     params = GenerationParams(
         caption=args.caption or "",
         task_type="extract",
+        instruction=task_instruction("extract", args.track),
         src_audio=args.src_audio,
         inference_steps=args.inference_steps,
         guidance_scale=args.guidance_scale,
         seed=args.seed,
+        shift=args.shift,
     )
 
     config = GenerationConfig(
@@ -781,10 +1084,7 @@ def cmd_extract(args):
 
 def cmd_lego(args):
     """Multi-track / add layer (base model only)."""
-    args = resolve_quality(args)
-    if "turbo" in (args.model or ""):
-        args.model = "acestep-v15-base"
-        log("Switched to base model (lego requires base)")
+    args = resolve_base_quality(args, "lego")
 
     if not args.src_audio:
         error_json("Must provide --src-audio for lego mode")
@@ -800,11 +1100,17 @@ def cmd_lego(args):
     params = GenerationParams(
         caption=args.caption or "",
         lyrics=args.lyrics or "",
+        vocal_language=args.language,
+        bpm=args.bpm,
+        keyscale=args.key or "",
         task_type="lego",
+        instruction=task_instruction("lego", args.track),
         src_audio=args.src_audio,
         inference_steps=args.inference_steps,
         guidance_scale=args.guidance_scale,
         seed=args.seed,
+        shift=args.shift,
+        thinking=args.thinking if llm_handler else False,
     )
 
     config = GenerationConfig(batch_size=1, audio_format=args.format)
@@ -836,11 +1142,20 @@ def cmd_lego(args):
 
     outputs = rename_outputs(
         args, outputs,
-        label=informative_stem(args.src_audio) or "lego",
+        label="_".join(filter(None, [informative_stem(args.src_audio) or "lego",
+                                     args.track])),
         task_type="lego")
+
+    # lego returns the new layer alone, not the source with the layer on top
+    if args.mix:
+        for out in outputs:
+            mix_path = mix_with_source(args.src_audio, out["path"], args.mix_gain)
+            if mix_path:
+                out["mix_path"] = mix_path
 
     output_json({
         "success": True, "task_type": "lego",
+        "track": args.track,
         "outputs": outputs,
         "timing": {"generation_sec": round(gen_time, 1)},
         "count": len(outputs),
@@ -853,10 +1168,7 @@ def cmd_lego(args):
 
 def cmd_complete(args):
     """Audio completion (base model only)."""
-    args = resolve_quality(args)
-    if "turbo" in (args.model or ""):
-        args.model = "acestep-v15-base"
-        log("Switched to base model (complete requires base)")
+    args = resolve_base_quality(args, "complete")
 
     if not args.src_audio:
         error_json("Must provide --src-audio for complete mode")
@@ -873,11 +1185,13 @@ def cmd_complete(args):
         caption=args.caption or "",
         lyrics=args.lyrics or "",
         task_type="complete",
+        instruction=task_instruction("complete"),
         src_audio=args.src_audio,
         duration=args.duration if args.duration and args.duration > 0 else -1.0,
         inference_steps=args.inference_steps,
         guidance_scale=args.guidance_scale,
         seed=args.seed,
+        shift=args.shift,
     )
 
     config = GenerationConfig(batch_size=1, audio_format=args.format)
@@ -971,6 +1285,9 @@ def build_parser():
     parser.add_argument("--batch", type=int, default=None, help="Batch size (number of variants)")
     parser.add_argument("--progress", action="store_true",
                         help="Emit NDJSON progress events to stderr (for wrappers)")
+    parser.add_argument("--offload", choices=["auto", "on", "off"], default=None,
+                        help="Move idle models to CPU. auto: config.json, else on "
+                             "for discrete GPUs and off for unified memory")
     parser.add_argument("--output", default=None, help="Output file path (for single output)")
     parser.add_argument("--output-dir",
                         default=config_default(_cfg, "output_dir", "~/Music/claude-music-output"),
@@ -1042,6 +1359,8 @@ def build_parser():
     p_ext = sub.add_parser("extract", help="Track separation (base model only)")
     p_ext.add_argument("--src-audio", required=True)
     p_ext.add_argument("--caption", "-c", default="")
+    p_ext.add_argument("--track", choices=TRACK_NAMES, default=None,
+                       help="Which track to extract (e.g. vocals, drums, bass)")
     p_ext.add_argument("--inference-steps", type=int, default=None)
     p_ext.add_argument("--guidance-scale", type=float, default=None)
     p_ext.add_argument("--shift", type=float, default=None)
@@ -1056,13 +1375,22 @@ def build_parser():
     p_lego.add_argument("--src-audio", required=True)
     p_lego.add_argument("--caption", "-c", default="", help="Description of layer to add")
     p_lego.add_argument("--lyrics", "-l", default="")
+    p_lego.add_argument("--track", choices=TRACK_NAMES, default=None,
+                        help="Which layer to add (e.g. vocals, drums, bass)")
+    p_lego.add_argument("--mix", action="store_true",
+                        help="Also write the layer mixed over the source (<name>_mix)")
+    p_lego.add_argument("--mix-gain", type=float, default=0.0,
+                        help="Layer level in the mix, dB relative to the source")
+    p_lego.add_argument("--language", default=_lang)
+    p_lego.add_argument("--bpm", type=int, default=None)
+    p_lego.add_argument("--key", default=None)
     p_lego.add_argument("--inference-steps", type=int, default=None)
     p_lego.add_argument("--guidance-scale", type=float, default=None)
     p_lego.add_argument("--shift", type=float, default=None)
     p_lego.add_argument("--thinking", action="store_true", default=None)
     p_lego.add_argument("--no-thinking", dest="thinking", action="store_false")
-    p_lego.set_defaults(func=cmd_lego, instrumental=False, language="en",
-                        bpm=None, key=None, time_sig=None, duration=-1.0)
+    p_lego.set_defaults(func=cmd_lego, instrumental=False,
+                        time_sig=None, duration=-1.0)
 
     # --- complete ---
     p_comp = sub.add_parser("complete", help="Audio completion (base model only)")

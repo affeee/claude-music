@@ -7,8 +7,8 @@
     "format": "flac",
     "naming": "descriptive",
     "language": "en",
-    "offload_to_cpu": true,
-    "offload_dit_to_cpu": true,
+    "offload_to_cpu": "auto",
+    "offload_dit_to_cpu": "auto",
     "use_flash_attention": true
   }
 }

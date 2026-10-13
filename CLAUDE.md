@@ -69,6 +69,11 @@ claude-music/
 - Quality presets are in `QUALITY_PRESETS` dict at top of file
 - ACE-Step params map to `GenerationParams` dataclass — see `references/parameters.md`
 - Cover mode uses `src_audio` + `cover_noise_strength` (NOT `reference_audio` + `audio_cover_strength`)
+- extract/lego/complete go through `resolve_base_quality()` (turbo preset → base model with the `max` preset's steps/guidance/shift) and need `instruction=task_instruction(...)`; ACE-Step reads the track name from that text
+- `lego` outputs the new layer only; `--mix` writes `<name>_mix` beside it via `mix_with_source()` (ffmpeg `-n`, source untouched)
+- `initialize_acestep()` defaults `ACESTEP_GENERATION_TIMEOUT` to 3600; ACE-Step's own 600s cuts off base-model runs on full-length tracks
+- Unified memory (Apple Silicon) is handled in the engine, not in presets: `apply_memory_policy()` caps a preset's batch, `auto_offload()` picks offload per job, `fit_lm_to_memory()` swaps or skips an LM that ACE-Step does not list for the tier, `lm_backend()` returns `mlx`. Explicit `--batch` / `--offload` / config values always win. The numbers come from the runs in `references/apple-silicon.md`; re-measure before changing them
+- `--progress` silences tqdm and emits `step` events from the real diffusion loop (`track_diffusion_steps()`); `diffusion_pct()` overrides ACE-Step's time-based estimate inside `DIFFUSION_PCT_RANGE`
 
 ### Testing
 

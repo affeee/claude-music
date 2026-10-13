@@ -387,3 +387,204 @@ def test_export_uses_no_overwrite():
              if "ffmpeg " in ln and not ln.strip().startswith("#")]
     for ln in lines:
         assert " -y " not in ln, f"ffmpeg -y (overwrite) in export: {ln.strip()}"
+
+
+# ---------------------------------------------------------------------------
+# (g) Base-model tasks: extract / lego / complete
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("argv", [
+    ["lego", "--src-audio", "x.mp3", "--track", "vocals"],
+    ["extract", "--src-audio", "x.mp3"],
+    ["complete", "--src-audio", "x.mp3"],
+])
+def test_base_tasks_do_not_inherit_turbo_steps(engine_module, argv):
+    """Regression: a turbo preset switched to the base model kept turbo's
+    8 steps and guidance 0.0, which the base model cannot work with."""
+    parser = engine_module.build_parser()
+    args = engine_module.resolve_base_quality(
+        parser.parse_args(["--quality", "standard", *argv]), argv[0])
+    best = engine_module.QUALITY_PRESETS["max"]
+    assert args.model == "acestep-v15-base"
+    assert args.inference_steps == best["inference_steps"]
+    assert args.guidance_scale == best["guidance_scale"]
+    assert args.shift == best["shift"]
+
+
+def test_base_tasks_keep_explicit_steps(engine_module):
+    parser = engine_module.build_parser()
+    args = engine_module.resolve_base_quality(parser.parse_args(
+        ["--quality", "standard", "lego", "--src-audio", "x.mp3",
+         "--inference-steps", "50"]), "lego")
+    assert args.inference_steps == 50
+    assert args.guidance_scale == engine_module.QUALITY_PRESETS["max"]["guidance_scale"]
+
+
+def test_task_instruction_names_the_track(engine_module):
+    """ACE-Step reads the track from the instruction text; without it lego
+    does not know which layer to add."""
+    assert engine_module.task_instruction("lego", "vocals") == (
+        "Generate the VOCALS track based on the audio context:")
+    assert engine_module.task_instruction("lego") == (
+        "Generate the track based on the audio context:")
+    assert engine_module.task_instruction("extract", "drums") == (
+        "Extract the DRUMS track from the audio:")
+
+
+def test_lego_passes_instruction_and_language(engine_source):
+    assert 'instruction=task_instruction("lego", args.track)' in engine_source
+    parser_args = ["lego", "--src-audio", "x.mp3", "--track", "vocals",
+                   "--language", "sv", "--bpm", "129", "--key", "C minor", "--mix"]
+    import music_engine
+    args = music_engine.build_parser().parse_args(parser_args)
+    assert (args.track, args.language, args.bpm, args.key, args.mix) == (
+        "vocals", "sv", 129, "C minor", True)
+
+
+def test_generation_timeout_is_raised(engine_source):
+    """ACE-Step's 600s default kills a base-model run on a full-length track."""
+    assert 'os.environ.setdefault("ACESTEP_GENERATION_TIMEOUT"' in engine_source
+
+
+def test_mix_command_never_overwrites_or_touches_source(engine_module):
+    cmd = engine_module.build_mix_command("src.mp3", "layer.flac", "out.flac", -2.0)
+    assert cmd[0] == "ffmpeg" and "-n" in cmd and "-y" not in cmd
+    assert cmd[-1] == "out.flac"
+    graph = cmd[cmd.index("-filter_complex") + 1]
+    assert "volume=-5.0dB[layer]" in graph
+    assert "alimiter" in graph
+
+
+def test_mix_with_source_writes_beside_layer(engine_module, tmp_path):
+    import shutil
+    if not shutil.which("ffmpeg"):
+        pytest.skip("ffmpeg not installed")
+    src, layer = tmp_path / "src.wav", tmp_path / "layer.wav"
+    for path, freq in ((src, 220), (layer, 440)):
+        subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i",
+                        f"sine=frequency={freq}:duration=1", str(path)], check=True)
+    first = engine_module.mix_with_source(str(src), str(layer))
+    second = engine_module.mix_with_source(str(src), str(layer))
+    assert first == str(tmp_path / "layer_mix.wav")
+    assert second == str(tmp_path / "layer_mix-2.wav")
+    assert Path(first).stat().st_size > 0 and Path(second).stat().st_size > 0
+
+
+# ---------------------------------------------------------------------------
+# (h) Unified memory (Apple Silicon): batch, LM, offload, progress
+# ---------------------------------------------------------------------------
+
+MAC_16 = {"unified_memory": True, "memory_gb": 16.0}
+MAC_64 = {"unified_memory": True, "memory_gb": 64.0}
+NVIDIA = {"unified_memory": False, "memory_gb": 32.0}
+
+
+def test_memory_safe_batch_caps_full_tracks_on_small_macs(engine_module):
+    safe = engine_module.memory_safe_batch
+    assert safe(2, 182, profile=MAC_16) == 1, "two full-length variants ran out of MPS memory"
+    assert safe(4, 30, profile=MAC_16) == 4, "short drafts keep their variants"
+    assert safe(2, None, profile=MAC_16) == 1, "unknown length counts as a full track"
+    assert safe(2, 182, profile=MAC_64) == 2
+    assert safe(2, 600, profile=MAC_16) == 1, "never below one"
+
+
+def test_memory_policy_leaves_discrete_gpus_alone(engine_module):
+    assert engine_module.memory_safe_batch(4, 600, profile=NVIDIA) == 4
+
+
+def test_explicit_batch_is_never_capped(engine_module, monkeypatch):
+    monkeypatch.setattr(engine_module, "machine_profile", lambda: MAC_16)
+    parser = engine_module.build_parser()
+    args = engine_module.resolve_quality(parser.parse_args(
+        ["--quality", "high", "--batch", "2", "generate", "-c", "x", "--duration", "240"]))
+    assert args.batch == 2
+    capped = engine_module.resolve_quality(parser.parse_args(
+        ["--quality", "high", "generate", "-c", "x", "--duration", "240"]))
+    if not (engine_module.load_config().get("defaults") or {}).get("batch_size"):
+        assert capped.batch == 1
+
+
+def test_lm_is_skipped_for_tasks_that_ignore_it(engine_module):
+    """ACE-Step skips the LM for cover/repaint/extract; loading it anyway cost
+    several GB and helped kill a batch-2 cover on a 16GB Mac."""
+    ns = argparse.Namespace
+    assert engine_module.task_uses_lm(ns(command="generate"))
+    assert engine_module.task_uses_lm(ns(command="lego"))
+    for task in ("cover", "repaint", "extract"):
+        assert not engine_module.task_uses_lm(ns(command=task))
+
+
+def _job(command="cover", batch=1, duration=182.0, lm=False, offload=None):
+    return argparse.Namespace(
+        command=command, batch=batch, _duration_sec=duration, offload=offload,
+        lm_model="acestep-5Hz-lm-1.7B" if lm else None, thinking=lm)
+
+
+def test_auto_offload_on_unified_memory(engine_module):
+    """Measured on an M1/16GB, 182s track: offload off is ~24% faster for one
+    variant, but two variants run out of MPS memory unless offloaded."""
+    auto = engine_module.auto_offload
+    assert auto(_job(), MAC_16) is False
+    assert auto(_job(batch=2), MAC_16) is True
+    assert auto(_job(batch=2, duration=None), MAC_16) is True
+    assert auto(_job(), NVIDIA) is True, "discrete GPUs keep offloading"
+
+
+def test_offload_precedence(engine_module, monkeypatch):
+    resolve = engine_module.resolve_offload
+    monkeypatch.setattr(engine_module, "machine_profile", lambda: MAC_16)
+    assert resolve(_job(), {}, "offload_to_cpu") is False
+    assert resolve(_job(), {"offload_to_cpu": "auto"}, "offload_to_cpu") is False
+    assert resolve(_job(), {"offload_to_cpu": True}, "offload_to_cpu") is True
+    assert resolve(_job(offload="off"), {"offload_to_cpu": True}, "offload_to_cpu") is False
+    monkeypatch.setattr(engine_module, "machine_profile", lambda: NVIDIA)
+    assert resolve(_job(), {}, "offload_to_cpu") is True
+    assert resolve(_job(offload="off"), {}, "offload_to_cpu") is False
+
+
+def test_diffusion_pct_follows_real_steps(engine_module):
+    """ACE-Step's estimator said 58% with 0 of 50 steps done."""
+    state = engine_module._diffusion
+    saved = dict(state)
+    try:
+        state.update(step=0, total=50)
+        assert engine_module.diffusion_pct(0.58) == 0.52
+        state.update(step=25, total=50)
+        assert engine_module.diffusion_pct(0.58) == pytest.approx(0.655)
+        assert engine_module.diffusion_pct(0.30) == 0.30, "other phases pass through"
+        assert engine_module.diffusion_pct(0.90) == 0.90
+        assert engine_module.diffusion_pct(None) is None
+    finally:
+        state.update(saved)
+
+
+def test_detect_gpu_reports_apple_silicon(scripts_dir):
+    import platform
+    if platform.system() != "Darwin" or platform.machine() != "arm64":
+        pytest.skip("Apple Silicon only")
+    out = subprocess.run(["bash", str(scripts_dir / "detect_gpu.sh")],
+                         check=True, capture_output=True, text=True).stdout
+    info = json.loads(out)
+    assert info["gpu_detected"] is True
+    assert info["backend"] == "mps" and info["unified_memory"] is True
+    assert info["memory_total_mb"] > 0
+
+
+def test_lm_that_does_not_fit_unified_memory_is_replaced_or_skipped(engine_module):
+    """The 1.7B LM ran an M1/16GB out of memory on a 180s track with the pt
+    and mlx backends, offload on and off. ACE-Step lists only 0.6B there."""
+    fit = engine_module.fit_lm_to_memory
+    big, small = "acestep-5Hz-lm-1.7B", "acestep-5Hz-lm-0.6B"
+    model, note = fit(big, [small], installed=[big], profile=MAC_16)
+    assert model is None and "acestep-download --model " + small in note
+    model, note = fit(big, [small], installed=[big, small], profile=MAC_16)
+    assert model == small and note
+    assert fit(big, [small, big], installed=[big], profile=MAC_64) == (big, "")
+    assert fit(big, [small], installed=[big], profile=NVIDIA) == (big, ""), (
+        "discrete GPUs keep the preset's LM")
+    assert fit(big, [], installed=[big], profile=MAC_16) == (big, ""), "unknown tier: leave it"
+
+
+def test_lm_backend_is_mlx_on_apple_silicon(engine_module):
+    assert engine_module.lm_backend(MAC_16) == "mlx"
+    assert engine_module.lm_backend(NVIDIA) == "vllm"

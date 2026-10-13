@@ -10,6 +10,12 @@ if [ -f "$CONFIG" ] && command -v python3 &>/dev/null; then
 fi
 ACE_STEP_DIR="${ACE_STEP_DIR:-}"
 
+if [ "$(uname -s)" = "Darwin" ]; then
+    PKG="brew install"
+else
+    PKG="sudo apt install"
+fi
+
 check_tool() {
     local name="$1" cmd="$2" install_hint="$3" required="$4"
     # Split cmd into array for safe execution (no eval)
@@ -25,10 +31,10 @@ check_tool() {
 
 RESULTS=()
 RESULTS+=("$(check_tool "uv" "uv --version" "curl -LsSf https://astral.sh/uv/install.sh | sh" true)")
-RESULTS+=("$(check_tool "ffmpeg" "ffmpeg -version" "sudo apt install ffmpeg" true)")
-RESULTS+=("$(check_tool "ffprobe" "ffprobe -version" "sudo apt install ffmpeg" true)")
-RESULTS+=("$(check_tool "jq" "jq --version" "sudo apt install jq" true)")
-RESULTS+=("$(check_tool "ffplay" "ffplay -version" "sudo apt install ffmpeg" false)")
+RESULTS+=("$(check_tool "ffmpeg" "ffmpeg -version" "$PKG ffmpeg" true)")
+RESULTS+=("$(check_tool "ffprobe" "ffprobe -version" "$PKG ffmpeg" true)")
+RESULTS+=("$(check_tool "jq" "jq --version" "$PKG jq" true)")
+RESULTS+=("$(check_tool "ffplay" "ffplay -version" "$PKG ffmpeg" false)")
 
 if [ -d "$ACE_STEP_DIR" ] && [ -f "$ACE_STEP_DIR/pyproject.toml" ]; then
     RESULTS+=("{\"name\":\"ace-step\",\"installed\":true,\"version\":\"1.5\",\"path\":\"$ACE_STEP_DIR\",\"required\":true}")
@@ -52,7 +58,10 @@ for lm in "acestep-5Hz-lm-0.6B" "acestep-5Hz-lm-1.7B"; do
     fi
 done
 
-if command -v nvidia-smi &>/dev/null; then
+if [ "$(uname -s)" = "Darwin" ] && [ "$(uname -m)" = "arm64" ]; then
+    CHIP=$(sysctl -n machdep.cpu.brand_string 2>/dev/null || echo "Apple Silicon")
+    RESULTS+=("{\"name\":\"apple-silicon-gpu\",\"installed\":true,\"version\":\"$CHIP\",\"required\":true}")
+elif command -v nvidia-smi &>/dev/null; then
     GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader,nounits 2>/dev/null | head -1 | xargs)
     RESULTS+=("{\"name\":\"nvidia-gpu\",\"installed\":true,\"version\":\"$GPU_NAME\",\"required\":true}")
 else

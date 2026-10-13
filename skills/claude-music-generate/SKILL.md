@@ -108,6 +108,8 @@ bash ~/.claude/skills/claude-music/scripts/music_engine.sh generate \
 - **high**: turbo + 1.7B LM, thinking=True, batch=2. Better structure/lyrics adherence.
 - **max**: base model, steps=65, LM thinking, batch=1. Best quality, ~3-5 min.
 
+Times are for a 16 GB NVIDIA card. On Apple Silicon the engine lowers the batch for long tracks and may skip the LM; see `references/apple-silicon.md` in the main skill for real timings.
+
 ## Output
 
 JSON to stdout with paths, seeds, timing:

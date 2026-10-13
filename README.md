@@ -83,7 +83,9 @@ Everything in one page, running privately on your machine:
 ## What You Need
 
 - [Claude Code](https://claude.ai/code) (free CLI, desktop app, or VS Code)
-- An NVIDIA GPU with 4GB+ VRAM (8GB+ recommended; CPU works but is slow)
+- An NVIDIA GPU with 4GB+ VRAM (8GB+ recommended), or an Apple Silicon Mac
+  with 16GB+ memory (works, but minutes rather than seconds per song). CPU-only
+  works but is slow.
 - ~10GB of disk space
 
 The installer handles the rest (Python, FFmpeg, uv, ACE-Step).
@@ -122,7 +124,8 @@ To stop passing `--quality high` on every run, set it once in
 
 `quality`, `format`, `language` and the memory settings
 (`offload_to_cpu`, `offload_dit_to_cpu`, `use_flash_attention`) are read from
-there, as is the top-level `output_dir` (also changeable from the dashboard's
+there. The two offload keys take `"auto"` (the default: on for discrete GPUs,
+chosen per job on Apple Silicon), `true` or `false`, as is the top-level `output_dir` (also changeable from the dashboard's
 Settings gear).
 
 `model`, `lm_model`, `batch_size` and `thinking` are owned by the quality
@@ -207,7 +210,9 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the design decisions.
 | Symptom | Fix |
 |---------|-----|
 | `CUDA out of memory` | Other apps are holding VRAM. Close GPU-heavy programs, or use `draft` quality, shorter durations, and smaller batches. The dashboard warns when free VRAM is under 4 GB and names the apps holding it. |
-| No NVIDIA GPU detected | ACE-Step needs CUDA for reasonable speed. CPU-only generation works but is very slow. On AMD/Intel or macOS, check ACE-Step's own docs for ROCm/XPU/MPS scripts. |
+| No NVIDIA GPU detected | ACE-Step needs CUDA for reasonable speed. CPU-only generation works but is very slow. Apple Silicon is detected and tuned automatically; on AMD/Intel, check ACE-Step's own docs for ROCm/XPU scripts. |
+| `MPS backend out of memory` (Mac) | The job did not fit in unified memory. Generate one variant at a time, shorten the track, close other apps, or pass `--offload on`. Measured limits: [`references/apple-silicon.md`](skills/claude-music/references/apple-silicon.md). |
+| Slow on a Mac | Expected: about 6 minutes for a 3-minute song on an M1 with 16GB. The speeds in the table above are for NVIDIA cards. |
 | `uv: command not found` | Install uv: `curl -LsSf https://astral.sh/uv/install.sh \| sh`, then re-run `install.sh`. |
 | Dashboard says "setup required" | `config.json` still has the `CHANGE_ME` placeholder. Run `bash install.sh`. |
 | Dashboard port busy | The server auto-increments 8765-8775. Or pick one: `bash music_web.sh 9000`. |
@@ -231,7 +236,7 @@ Removes skill links only. Your generated music and ACE-Step are untouched.
 
 ```bash
 pip install -e ".[dev]"
-pytest tests/            # 54 contract tests, <1s, no GPU required
+pytest tests/            # 74 contract tests, ~1s, no GPU required
 ruff check skills/ tests/
 ```
 

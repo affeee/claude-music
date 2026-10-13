@@ -25,10 +25,13 @@ if ! command -v uv &>/dev/null; then
 fi
 echo "[OK] uv $(uv --version 2>&1 | head -1)"
 
-command -v ffmpeg &>/dev/null && echo "[OK] ffmpeg found" || echo "WARNING: ffmpeg not found (sudo apt install ffmpeg)"
-command -v jq &>/dev/null && echo "[OK] jq found" || echo "WARNING: jq not found (sudo apt install jq)"
+command -v ffmpeg &>/dev/null && echo "[OK] ffmpeg found" || echo "WARNING: ffmpeg not found (brew install ffmpeg / sudo apt install ffmpeg)"
+command -v jq &>/dev/null && echo "[OK] jq found" || echo "WARNING: jq not found (brew install jq / sudo apt install jq)"
 
-if command -v nvidia-smi &>/dev/null; then
+if [ "$(uname -s)" = "Darwin" ] && [ "$(uname -m)" = "arm64" ]; then
+    CHIP=$(sysctl -n machdep.cpu.brand_string 2>/dev/null || echo "Apple Silicon")
+    echo "[OK] GPU: $CHIP ($(( $(sysctl -n hw.memsize) / 1073741824 ))GB unified memory, MLX/MPS)"
+elif command -v nvidia-smi &>/dev/null; then
     GPU=$(nvidia-smi --query-gpu=name --format=csv,noheader,nounits 2>/dev/null | head -1)
     VRAM=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1)
     echo "[OK] GPU: $GPU (${VRAM}MB VRAM)"

@@ -60,6 +60,7 @@ When the user provides a specific command, load the matching sub-skill:
 - `/music library` or intent is list songs/browse output/manage music → Read `skills/claude-music-library/SKILL.md`
 - `/music web` or intent is dashboard/browser app/web UI/visual player → Read `skills/claude-music-web/SKILL.md`
 - `/music lora` or intent is train/fine-tune/LoRA/custom style → Read `skills/claude-music-lora/SKILL.md`
+- `/music lego` or intent is add vocals/lyrics/an instrument on top of an existing track **without changing it** → see "Adding a Layer to an Existing Track" below. Do not use cover for this: cover regenerates the whole song.
 - `/music setup` → Run `bash ~/.claude/skills/claude-music/scripts/setup.sh`
 
 ### Interactive Mode
@@ -96,7 +97,7 @@ After any generation:
 1. **Run preflight before writes**: `bash ~/.claude/skills/claude-music/scripts/preflight.sh "$INPUT" "$OUTPUT"`
 2. **Never overwrite source files** — all operations produce new files
 3. **Check VRAM before GPU operations**: `bash ~/.claude/skills/claude-music/scripts/detect_gpu.sh`
-4. **Confirm before**: batch >4 generations, operations with --quality max (3-5 min)
+4. **Confirm before**: batch >4 generations, operations with --quality max (3-5 min), and on Apple Silicon any base-model run on a full-length track (15-25 min)
 5. **Auto-execute without confirmation**: single generation (draft/standard), analysis, format conversion, setup
 6. **Temp files**: `/tmp/claude-music/` with cleanup trap
 7. **Output directory**: `~/Music/claude-music-output/` (auto-created)
@@ -107,6 +108,26 @@ After any generation:
 - **Invocation**: `bash ~/.claude/skills/claude-music/scripts/music_engine.sh <command> [args]`
 - **Config**: `~/.claude/skills/claude-music/config.json`
 - **Output**: `~/Music/claude-music-output/`
+
+## Adding a Layer to an Existing Track (lego)
+
+Use when the user wants singing, lyrics or an instrument added to a song they
+already have, with the original left intact.
+
+```bash
+bash ~/.claude/skills/claude-music/scripts/music_engine.sh --quality standard --progress lego \
+  --src-audio "$SRC" --track vocals --mix \
+  --caption "clear female lead vocal, catchy pop topline" \
+  --lyrics "$LYRICS" --language sv --bpm 129 --key "C minor" \
+  --inference-steps 50
+```
+
+- **Analyze first** (`/music analyze`): pass the source's real `--bpm` and `--key`, and lay the lyric sections out against its energy curve.
+- **`--track`** is one of vocals, backing_vocals, drums, bass, guitar, keyboard, percussion, strings, synth, fx, brass, woodwinds. Without it the model guesses which layer to add.
+- **The output is the new layer alone**, not the full song. `--mix` also writes `<name>_mix.<ext>` (source + layer, limiter on top) and reports it as `mix_path`. Rebalance with `--mix-gain <dB>` or by re-mixing the stem with ffmpeg; that needs no new generation.
+- **Needs the base model**: `cd <ace_step_dir> && uv run acestep-download --model acestep-v15-base --skip-main` (~4.8 GB). `--quality standard` keeps the LM unloaded, which matters on 16 GB machines; the engine still switches to the base model and its step/guidance settings.
+- **It is slow**: about 15 s per step for a 3-minute track on Apple Silicon (16 GB), so ~19 min at 50 steps. Run it in the background and tell the user up front. The engine raises ACE-Step's 600 s generation timeout to an hour (`ACESTEP_GENERATION_TIMEOUT` overrides).
+- **Progress**: with `--progress`, stderr carries `{"event": "step", "step": 11, "total": 50, "eta_sec": 547}` lines from the real diffusion loop. Report those.
 
 ## Quality Presets
 
@@ -127,6 +148,15 @@ After any generation:
 | XL Turbo | ~14-16GB | Full offload | Maximum quality DiT, no LM room |
 
 **Rule**: Never run two heavy models simultaneously. The music_engine.py handles VRAM automatically.
+
+## Apple Silicon
+
+When `detect_gpu.sh` reports `"backend": "mps"`, the tables above do not apply: memory is shared, and a 16 GB Mac is far tighter than a 16 GB card. Read `references/apple-silicon.md` before quoting a time or choosing a batch.
+
+- **Timings (M1, 16 GB)**: a full 3-minute track takes about 6 min per variant with turbo and 15-25 min with the base model. A 30 s draft takes 2-3 min.
+- **The engine adapts by itself**: one variant for full-length tracks, CPU offload chosen per job, MLX backend for the LM, and an LM that does not fit is swapped or skipped with a warning on stderr. Pass `--batch` or `--offload on|off` to override.
+- **On 16 GB, `high` runs without the 1.7B LM**, so it gives the same result as `standard`. Say so rather than promising better lyrics adherence.
+- **For another take, run again** instead of raising the batch: two variants at once take as long as two runs.
 
 ## Script Invocation
 
@@ -150,6 +180,7 @@ The wrapper handles: path setup, environment variables, VRAM pre-check, `uv run`
 | `references/post-processing.md` | When exporting, mastering, or enhancing |
 | `references/song-structures.md` | When planning song layout |
 | `references/lora-training.md` | When training custom LoRA models |
+| `references/apple-silicon.md` | When `detect_gpu.sh` reports `"backend": "mps"`: timings, memory limits, progress events |
 
 ## Sub-Skills
 
@@ -175,7 +206,7 @@ The wrapper handles: path setup, environment variables, VRAM pre-check, `uv run`
 | `scripts/music_engine.sh` | Bash wrapper (env, VRAM, `uv run`, show-once star nudge) |
 | `scripts/music_export.sh` | FFmpeg platform export commands |
 | `scripts/rank.py` | Batch-rank outputs vs caption (stub — Theme 3 of research plan) |
-| `scripts/detect_gpu.sh` | GPU detection + tier recommendation → JSON |
+| `scripts/detect_gpu.sh` | GPU detection (NVIDIA or Apple Silicon) + tier recommendation → JSON |
 | `scripts/preflight.sh` | Safety checks for audio files → JSON |
 | `scripts/check_deps.sh` | Dependency verification → JSON |
 | `scripts/setup.sh` | Installation verification (invoked by `/music setup`) |

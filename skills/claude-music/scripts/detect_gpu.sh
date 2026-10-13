@@ -3,6 +3,34 @@
 # Output: JSON with gpu_name, driver, vram_total_mb, vram_free_mb, tier, recommendations
 set -euo pipefail
 
+# Apple Silicon: ACE-Step runs on MLX/MPS and the GPU shares system memory, so
+# the tier comes from total RAM and there is no separate VRAM figure.
+if [ "$(uname -s)" = "Darwin" ] && [ "$(uname -m)" = "arm64" ]; then
+    CHIP=$(sysctl -n machdep.cpu.brand_string 2>/dev/null || echo "Apple Silicon")
+    MEM_TOTAL=$(( $(sysctl -n hw.memsize) / 1048576 ))
+    if [ "$MEM_TOTAL" -ge 48000 ]; then
+        TIER="high"; REC_LM="acestep-5Hz-lm-1.7B"
+    elif [ "$MEM_TOTAL" -ge 24000 ]; then
+        TIER="standard"; REC_LM="acestep-5Hz-lm-1.7B"
+    else
+        TIER="low"; REC_LM="none"
+    fi
+    cat <<EOF
+{
+  "gpu_detected": true,
+  "backend": "mps",
+  "gpu_name": "$CHIP",
+  "unified_memory": true,
+  "memory_total_mb": $MEM_TOTAL,
+  "tier": "$TIER",
+  "recommended_model": "acestep-v15-turbo",
+  "recommended_lm": "$REC_LM",
+  "notes": "Timings and memory limits: references/apple-silicon.md"
+}
+EOF
+    exit 0
+fi
+
 if ! command -v nvidia-smi &>/dev/null; then
     echo '{"gpu_detected":false,"error":"nvidia-smi not found"}'
     exit 0
