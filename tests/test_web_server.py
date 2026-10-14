@@ -483,3 +483,28 @@ def test_live_server_smoke(server_module, tmp_path, monkeypatch):
     finally:
         httpd.shutdown()
         httpd.server_close()
+
+
+def test_server_stops_when_stdin_closes(server_module):
+    """music_web.sh keeps a pipe on the server's stdin; when the launcher dies
+    the pipe closes and the server must exit instead of keeping the port."""
+    import os
+    from http.server import BaseHTTPRequestHandler
+
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), BaseHTTPRequestHandler)
+    serving = threading.Thread(target=httpd.serve_forever, daemon=True)
+    serving.start()
+    r, w = os.pipe()
+    try:
+        with os.fdopen(r, "rb") as stream:
+            server_module.shutdown_on_stdin_eof(httpd, stream)
+            os.write(w, b"still here")
+            serving.join(timeout=0.5)
+            assert serving.is_alive(), "data on stdin must not stop the server"
+            os.close(w)
+            serving.join(timeout=5)
+            assert not serving.is_alive(), "server kept running after stdin EOF"
+    finally:
+        if serving.is_alive():
+            httpd.shutdown()
+        httpd.server_close()

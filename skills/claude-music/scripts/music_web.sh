@@ -21,7 +21,10 @@ if [ ! -f "$CONFIG" ] || grep -q "CHANGE_ME" "$CONFIG" 2>/dev/null; then
     echo "    Run install.sh to enable generation." >&2
 fi
 
-"$PYTHON" "$WEBAPP_DIR/server.py" --port "$PORT" &
+# The server reads its stdin from a pipe whose write end only this shell
+# holds. However this shell ends (Ctrl-C, kill -9, a closed terminal), the
+# pipe closes and the server shuts itself down instead of keeping the port.
+exec {KEEPALIVE}> >(exec "$PYTHON" "$WEBAPP_DIR/server.py" --port "$PORT" --exit-with-stdin)
 SERVER_PID=$!
 trap 'kill "$SERVER_PID" 2>/dev/null || true' INT TERM EXIT
 

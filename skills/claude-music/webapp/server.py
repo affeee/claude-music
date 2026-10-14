@@ -1198,7 +1198,25 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"error": str(e)}, 500)
 
 
-def serve(port=8765, max_port=8775):
+def shutdown_on_stdin_eof(httpd, stream=None):
+    """Stop the server once stdin reaches EOF, i.e. the launcher holding the
+    other end of the pipe is gone. Signals do not cover this: a launcher killed
+    outright never runs its trap, and on Windows the trap cannot reach a native
+    Python child, which then keeps the port."""
+    stream = stream if stream is not None else sys.stdin.buffer
+
+    def watch():
+        with contextlib.suppress(Exception):
+            while stream.read(4096):
+                pass
+        httpd.shutdown()
+
+    t = threading.Thread(target=watch, daemon=True)
+    t.start()
+    return t
+
+
+def serve(port=8765, max_port=8775, exit_with_stdin=False):
     cfg = load_config()
     out_dir = resolve_output_dir(cfg)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -1216,6 +1234,8 @@ def serve(port=8765, max_port=8775):
         sys.exit(1)
     print(f"claude-music web: http://127.0.0.1:{httpd.server_address[1]}",
           flush=True)
+    if exit_with_stdin:
+        shutdown_on_stdin_eof(httpd)
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
@@ -1227,5 +1247,8 @@ def serve(port=8765, max_port=8775):
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(description="claude-music web dashboard")
     ap.add_argument("--port", type=int, default=8765)
+    ap.add_argument("--exit-with-stdin", action="store_true",
+                    help="Shut down when stdin closes (set by music_web.sh)")
     args = ap.parse_args()
-    serve(port=args.port, max_port=args.port + 10)
+    serve(port=args.port, max_port=args.port + 10,
+          exit_with_stdin=args.exit_with_stdin)
