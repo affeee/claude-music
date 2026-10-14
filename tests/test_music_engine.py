@@ -238,9 +238,16 @@ def test_config_defaults_are_honoured_by_parser(engine_module):
     assert args.language == (defaults.get("language") or "en")
 
 
-def test_quality_preset_survives_explicit_flag(engine_module):
+def test_quality_preset_survives_explicit_flag(engine_module, monkeypatch):
     """CLI > config > preset. An explicit --quality must restore that preset's
-    model/LM/thinking/batch even when config.json defaults to something else."""
+    model/LM/thinking/batch even when config.json defaults to something else.
+
+    Runs against the shipped config.example.json: a per-machine config.json may
+    pin a preset-owned key on purpose (batch_size 1 on a CPU-only box)."""
+    example = (Path(__file__).resolve().parents[1]
+               / "skills" / "claude-music" / "config.example.json")
+    monkeypatch.setattr(engine_module, "load_config",
+                        lambda: json.loads(example.read_text(encoding="utf-8-sig")))
     parser = engine_module.build_parser()
 
     draft = engine_module.resolve_quality(
@@ -698,3 +705,15 @@ def test_listen_has_no_heavy_imports_at_module_level(scripts_dir):
     top = {n.names[0].name.split(".")[0] for n in tree.body if isinstance(n, ast.Import)}
     top |= {n.module.split(".")[0] for n in tree.body if isinstance(n, ast.ImportFrom)}
     assert not top & {"numpy", "librosa", "matplotlib", "soundfile", "mlx_whisper"}
+
+
+@pytest.mark.parametrize("desc,total,expected,hit", [
+    ("Diffusion steps", 8, 8, True),     # turbo labels its bar
+    ("", 50, 50, True),                  # base model: unlabelled, step count
+    (None, 50, 50, True),
+    ("", 12, 50, False),                 # unlabelled but not the step count
+    ("", 50, None, False),               # step count unknown
+    ("Decoding audio chunks", 50, 50, False),
+])
+def test_is_diffusion_bar(engine_module, desc, total, expected, hit):
+    assert engine_module.is_diffusion_bar(desc, total, expected) is hit

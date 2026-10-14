@@ -124,7 +124,17 @@ def diffusion_pct(pct):
     return round(start + (end - start) * done, 4)
 
 
-def track_diffusion_steps():
+def is_diffusion_bar(desc, total, expected_steps):
+    """Whether a tqdm bar is the diffusion loop. Turbo labels its bar; the base
+    model's has no desc at all, so an unlabelled bar of exactly the requested
+    step count counts too. Labelled bars (VAE chunks etc.) never do."""
+    desc = str(desc or "")
+    if "diffusion" in desc.lower():
+        return True
+    return not desc and bool(expected_steps) and total == expected_steps
+
+
+def track_diffusion_steps(expected_steps=None):
     """Turn tqdm's diffusion bar into NDJSON 'step' events (--progress only).
 
     Bars are silenced so they cannot glue themselves to the front of a JSON
@@ -145,7 +155,8 @@ def track_diffusion_steps():
         if total is None:
             with contextlib.suppress(Exception):
                 total = len(iterable)
-        self._cm_steps = int(total or 0) if "diffusion" in str(desc).lower() else 0
+        self._cm_steps = (int(total or 0)
+                          if is_diffusion_bar(desc, total, expected_steps) else 0)
         kw["disable"] = True
         orig_init(self, *a, **kw)
 
@@ -603,13 +614,24 @@ def initialize_acestep(args):
 
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
     os.environ["TORCHAUDIO_USE_BACKEND"] = "ffmpeg"
-    # ACE-Step aborts a generation after 600s, model load included. The base
-    # model on a full-length track needs longer than that off a big GPU.
-    os.environ.setdefault("ACESTEP_GENERATION_TIMEOUT", "3600")
+    import torch
+    cpu_only = not torch.cuda.is_available() and not (
+        hasattr(torch.backends, "mps") and torch.backends.mps.is_available())
+    # ACE-Step aborts a generation after 600s, model load included, reading
+    # the limit at import. The base model on a full-length track needs longer
+    # than that off a big GPU, and hours on a CPU alone.
+    os.environ.setdefault("ACESTEP_GENERATION_TIMEOUT",
+                          "21600" if cpu_only else "3600")
+    if cpu_only:
+        # torch uses one thread per physical core; adding the hyperthreads
+        # ran ~10% faster on a 4-core i5-1135G7
+        torch.set_num_threads(os.cpu_count() or torch.get_num_threads())
+        log(f"CPU only: {torch.get_num_threads()} threads, "
+            f"{os.environ['ACESTEP_GENERATION_TIMEOUT']}s generation timeout")
 
     from acestep.handler import AceStepHandler
     if getattr(args, "progress", False):
-        track_diffusion_steps()
+        track_diffusion_steps(getattr(args, "inference_steps", None))
         emit_event("stage", stage="loading_model")
     log(f"Loading DiT model: {args.model}...")
 
