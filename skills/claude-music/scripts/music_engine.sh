@@ -9,10 +9,9 @@ SCRIPT="$SCRIPT_DIR/music_engine.py"
 CONFIG="$SCRIPT_DIR/../config.json"
 
 # Read ACE-Step path from config.json
-if [ -f "$CONFIG" ] && command -v python3 &>/dev/null; then
-    ACE_STEP_DIR=$(python3 -c "import json; print(json.load(open('$CONFIG'))['ace_step_dir'])" 2>/dev/null)
-fi
-ACE_STEP_DIR="${ACE_STEP_DIR:-}"
+# shellcheck source=_common.sh
+source "$SCRIPT_DIR/_common.sh"
+ACE_STEP_DIR=$(read_ace_step_dir "$CONFIG")
 
 # Pre-flight: check ACE-Step exists
 if [ ! -d "$ACE_STEP_DIR" ]; then
@@ -56,7 +55,7 @@ show_star_prompt() {
 # Run via uv from ACE-Step directory, capture JSON so we can inspect success
 # (replacing `exec` — the tail hook below needs to run after).
 cd "$ACE_STEP_DIR"
-if OUT=$(uv run python3 "$SCRIPT" --ace-step-dir "$ACE_STEP_DIR" "$@"); then
+if OUT=$(uv run python "$SCRIPT" --ace-step-dir "$ACE_STEP_DIR" "$@"); then
     printf '%s\n' "$OUT"
     # Success branch: parse `"success": true` and nudge the star once.
     if printf '%s' "$OUT" | grep -q '"success"[[:space:]]*:[[:space:]]*true'; then

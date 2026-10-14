@@ -1,4 +1,4 @@
-# claude-music — Windows Installer (PowerShell)
+# claude-music - Windows Installer (PowerShell)
 # Port of install.sh for Windows users. Requires PowerShell 5.1+ and Developer Mode
 # (or Administrator) for symlink creation.
 #
@@ -110,7 +110,7 @@ if (-not $aceDir) {
         Write-Host "  Installing ACE-Step Python deps (this can take 5-15 min)..."
         uv sync
         if ($LASTEXITCODE -ne 0) {
-            Write-Warn "uv sync reported errors. ACE-Step may still work — test with a small /music generate call."
+            Write-Warn "uv sync reported errors. ACE-Step may still work - test with a small /music generate call."
         }
         Pop-Location
         Write-Ok "ACE-Step installed"
@@ -186,7 +186,7 @@ foreach ($s in $skillDirs) {
     } catch {
         Write-Warn "Symlink failed for $($s.Name). Falling back to copy."
         Copy-Item -Path $s.FullName -Destination $link -Recurse -Force
-        Write-Ok "Copied $($s.Name) (note: edits won't auto-sync — re-run installer after changes)"
+        Write-Ok "Copied $($s.Name) (note: edits won't auto-sync - re-run installer after changes)"
     }
 }
 

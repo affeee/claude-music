@@ -20,4 +20,4 @@ fi
 
 exec uv run --quiet --no-project \
     --with librosa --with soundfile --with matplotlib --with "$WHISPER" \
-    python3 "$SCRIPT_DIR/music_listen.py" "$@"
+    python "$SCRIPT_DIR/music_listen.py" "$@"

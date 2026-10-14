@@ -8,7 +8,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WEBAPP_DIR="$SCRIPT_DIR/../webapp"
 PORT="${1:-8765}"
 
-if ! command -v python3 >/dev/null 2>&1; then
+# shellcheck source=_common.sh
+source "$SCRIPT_DIR/_common.sh"
+if ! PYTHON=$(find_python); then
     echo '{"success": false, "error": "python3 not found", "suggestion": "Install Python 3 first"}'
     exit 1
 fi
@@ -19,7 +21,7 @@ if [ ! -f "$CONFIG" ] || grep -q "CHANGE_ME" "$CONFIG" 2>/dev/null; then
     echo "    Run install.sh to enable generation." >&2
 fi
 
-python3 "$WEBAPP_DIR/server.py" --port "$PORT" &
+"$PYTHON" "$WEBAPP_DIR/server.py" --port "$PORT" &
 SERVER_PID=$!
 trap 'kill "$SERVER_PID" 2>/dev/null || true' INT TERM EXIT
 

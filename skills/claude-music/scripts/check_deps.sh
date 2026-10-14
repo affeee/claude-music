@@ -5,10 +5,9 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 CONFIG="$SCRIPT_DIR/../config.json"
-if [ -f "$CONFIG" ] && command -v python3 &>/dev/null; then
-    ACE_STEP_DIR=$(python3 -c "import json; print(json.load(open('$CONFIG'))['ace_step_dir'])" 2>/dev/null)
-fi
-ACE_STEP_DIR="${ACE_STEP_DIR:-}"
+# shellcheck source=_common.sh
+source "$SCRIPT_DIR/_common.sh"
+ACE_STEP_DIR=$(read_ace_step_dir "$CONFIG")
 
 if [ "$(uname -s)" = "Darwin" ]; then
     PKG="brew install"
