@@ -508,3 +508,14 @@ def test_server_stops_when_stdin_closes(server_module):
         if serving.is_alive():
             httpd.shutdown()
         httpd.server_close()
+
+
+def test_every_subprocess_detaches_stdin(server_source):
+    """Children must not inherit the server's stdin: under --exit-with-stdin it
+    is the launcher's keepalive pipe, and on Windows a child sharing it hangs
+    at startup behind the watcher thread's pending read."""
+    import re
+    calls = len(re.findall(r"subprocess\.(?:run|Popen|call|check_output)\(",
+                           server_source))
+    assert calls > 0
+    assert server_source.count("stdin=subprocess.DEVNULL") == calls

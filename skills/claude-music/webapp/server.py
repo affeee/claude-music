@@ -168,7 +168,7 @@ def ffprobe_info(path):
         out = subprocess.run(
             ["ffprobe", "-v", "quiet", "-print_format", "json",
              "-show_format", "-show_streams", str(path)],
-            capture_output=True, text=True, timeout=30)
+            stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30)
         info = json.loads(out.stdout)
         if not info.get("format") or not float(info["format"].get("duration", 0)):
             return None
@@ -196,7 +196,7 @@ def measure_loudness(path):
             ["ffmpeg", "-hide_banner", "-nostdin", "-i", str(path),
              "-af", "loudnorm=I=-14:TP=-1:LRA=11:print_format=json",
              "-f", "null", "-"],
-            capture_output=True, text=True, timeout=300)
+            stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=300)
         return parse_loudnorm_json(out.stderr)
     except Exception:
         return None
@@ -281,7 +281,7 @@ def gpu_hog_processes(limit=4):
         out = subprocess.run(
             ["nvidia-smi", "--query-compute-apps=pid,used_memory",
              "--format=csv,noheader,nounits"],
-            capture_output=True, text=True, timeout=5)
+            stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=5)
         rows = []
         for line in out.stdout.strip().splitlines():
             pid_s, mem_s = [p.strip() for p in line.split(",")]
@@ -333,7 +333,7 @@ def generate_lyrics(topic, style, language):
     try:
         out = subprocess.run(
             ["claude", "-p", lyrics_prompt(topic, style, language)],
-            capture_output=True, text=True, timeout=120)
+            stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=120)
     except FileNotFoundError:
         return None, ("Claude Code CLI not found. Leave lyrics empty instead:"
                       " the high preset writes them from your description.")
@@ -372,7 +372,7 @@ def free_vram_mb():
         out = subprocess.run(
             ["nvidia-smi", "--query-gpu=memory.free",
              "--format=csv,noheader,nounits"],
-            capture_output=True, text=True, timeout=5)
+            stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=5)
         return int(out.stdout.strip().splitlines()[0])
     except Exception:
         return None
@@ -592,7 +592,9 @@ class JobRunner:
         fmt = defaults.get("format") or "flac"
         out_dir = str(resolve_output_dir(cfg))
         engine = str(SCRIPTS_DIR / "music_engine.py")
-        cmd = ["uv", "run", "python3", engine,
+        # "python", not "python3": Windows venvs have no python3.exe, so uv
+        # falls through to the Microsoft Store stub (exit 9009)
+        cmd = ["uv", "run", "python", engine,
                "--ace-step-dir", os.path.expanduser(cfg["ace_step_dir"]),
                "--progress",
                "--quality", quality,
@@ -638,8 +640,12 @@ class JobRunner:
                    TOKENIZERS_PARALLELISM="false",
                    TORCHAUDIO_USE_BACKEND="ffmpeg",
                    PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True")
+        # stdin=DEVNULL on every child: with --exit-with-stdin our stdin is the
+        # launcher's keepalive pipe, and on Windows a child sharing that pipe
+        # hangs at startup behind the watcher's pending read.
         proc = subprocess.Popen(
             cmd, cwd=os.path.expanduser(cfg["ace_step_dir"]),
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, env=env)
 
@@ -1067,7 +1073,7 @@ class Handler(BaseHTTPRequestHandler):
             run = subprocess.run(
                 ["ffmpeg", "-hide_banner", "-nostdin", "-n", "-i", str(path),
                  "-af", loudnorm] + spec["args"] + [str(dest)],
-                capture_output=True, text=True, timeout=600)
+                stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=600)
         except subprocess.TimeoutExpired:
             self._json({"error": "Optimization timed out"}, 500)
             return
@@ -1186,6 +1192,7 @@ class Handler(BaseHTTPRequestHandler):
                 opener = {"linux": "xdg-open", "darwin": "open",
                           "win32": "explorer"}.get(sys.platform, "xdg-open")
                 subprocess.Popen([opener, folder],
+                                 stdin=subprocess.DEVNULL,
                                  stdout=subprocess.DEVNULL,
                                  stderr=subprocess.DEVNULL)
                 self._json({"ok": True, "folder": folder})
