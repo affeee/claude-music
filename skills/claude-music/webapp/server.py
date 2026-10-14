@@ -50,7 +50,8 @@ FILENAME_RE = re.compile(
 def load_config():
     """Read the skill's config.json. Returns {} when missing/broken."""
     try:
-        with CONFIG_PATH.open() as f:
+        # utf-8-sig: install.ps1 writes config.json with a BOM
+        with CONFIG_PATH.open(encoding="utf-8-sig") as f:
             cfg = json.load(f)
         return cfg if isinstance(cfg, dict) else {}
     except Exception:

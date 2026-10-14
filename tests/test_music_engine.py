@@ -20,7 +20,7 @@ import json
 import subprocess
 import uuid
 from contextlib import redirect_stdout
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 import pytest
 
@@ -197,7 +197,9 @@ def test_config_json_placeholder_or_absolute(config_json):
     Anything else suggests an accidentally-committed user path (VULN-002
     regression guard)."""
     ace_dir = config_json["ace_step_dir"]
-    assert ace_dir == "CHANGE_ME" or ace_dir.startswith("/") or ace_dir.startswith("~"), (
+    absolute = (ace_dir.startswith("/") or ace_dir.startswith("~")
+                or PureWindowsPath(ace_dir).is_absolute())  # install.ps1: C:\...
+    assert ace_dir == "CHANGE_ME" or absolute, (
         f"ace_step_dir should be 'CHANGE_ME' pre-install or an absolute path, "
         f"got: {ace_dir!r}. If a user's personal path leaked, run the installer "
         f"or reset to 'CHANGE_ME' before committing."
