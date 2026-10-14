@@ -15,7 +15,7 @@ ACE_STEP_DIR=$(read_ace_step_dir "$CONFIG")
 
 # Pre-flight: check ACE-Step exists
 if [ ! -d "$ACE_STEP_DIR" ]; then
-    echo '{"success":false,"error":"ACE-Step not found at '"$ACE_STEP_DIR"'","suggestion":"Install ACE-Step 1.5 or update config.json"}'
+    echo '{"success":false,"error":"ACE-Step not found at '"$(json_escape "$ACE_STEP_DIR")"'","suggestion":"Install ACE-Step 1.5 or update config.json"}'
     exit 1
 fi
 

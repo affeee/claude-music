@@ -15,6 +15,13 @@ find_python() {
     return 1
 }
 
+# Escape a value for use inside a JSON string literal. Windows paths carry
+# backslashes, which are invalid JSON escapes when echoed raw.
+json_escape() {
+    local s="${1//\\/\\\\}"
+    printf '%s' "${s//\"/\\\"}"
+}
+
 # ace_step_dir from config.json, or nothing when the file or Python is missing.
 # utf-8-sig because a config written by PowerShell starts with a BOM.
 read_ace_step_dir() {

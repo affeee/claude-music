@@ -36,9 +36,9 @@ RESULTS+=("$(check_tool "jq" "jq --version" "$PKG jq" true)")
 RESULTS+=("$(check_tool "ffplay" "ffplay -version" "$PKG ffmpeg" false)")
 
 if [ -d "$ACE_STEP_DIR" ] && [ -f "$ACE_STEP_DIR/pyproject.toml" ]; then
-    RESULTS+=("{\"name\":\"ace-step\",\"installed\":true,\"version\":\"1.5\",\"path\":\"$ACE_STEP_DIR\",\"required\":true}")
+    RESULTS+=("{\"name\":\"ace-step\",\"installed\":true,\"version\":\"1.5\",\"path\":\"$(json_escape "$ACE_STEP_DIR")\",\"required\":true}")
 else
-    RESULTS+=("{\"name\":\"ace-step\",\"installed\":false,\"install\":\"Install ACE-Step 1.5 to $ACE_STEP_DIR\",\"required\":true}")
+    RESULTS+=("{\"name\":\"ace-step\",\"installed\":false,\"install\":\"Install ACE-Step 1.5 to $(json_escape "$ACE_STEP_DIR")\",\"required\":true}")
 fi
 
 for model in "acestep-v15-turbo" "vae" "Qwen3-Embedding-0.6B"; do

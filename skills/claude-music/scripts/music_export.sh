@@ -8,13 +8,16 @@ PLATFORM="${1:-}"
 INPUT="${2:-}"
 OUTPUT="${3:-}"
 
+# shellcheck source=_common.sh
+source "$(dirname "$0")/_common.sh"
+
 if [ -z "$PLATFORM" ] || [ -z "$INPUT" ]; then
     echo '{"success":false,"error":"Usage: music_export.sh <platform> <input> [output]"}'
     exit 1
 fi
 
 if [ ! -f "$INPUT" ]; then
-    echo '{"success":false,"error":"Input file not found: '"$INPUT"'"}'
+    echo '{"success":false,"error":"Input file not found: '"$(json_escape "$INPUT")"'"}'
     exit 1
 fi
 
@@ -32,7 +35,7 @@ DIR=$(dirname "$INPUT")
 # Safety: don't overwrite existing files
 check_output() {
     if [ -f "$1" ]; then
-        echo '{"success":false,"error":"Output already exists: '"$1"'","suggestion":"Delete it first or specify a different --output path"}'
+        echo '{"success":false,"error":"Output already exists: '"$(json_escape "$1")"'","suggestion":"Delete it first or specify a different --output path"}'
         exit 1
     fi
 }
@@ -79,15 +82,16 @@ case "$PLATFORM" in
         ffmpeg -n -i "$INPUT" -c:a libmp3lame -b:a 320k "$OUT" 2>/dev/null
         ;;
     *)
-        echo '{"success":false,"error":"Unknown platform: '"$PLATFORM"'. Use: spotify, youtube, tiktok, podcast, cd, archive, web, mp3"}'
+        echo '{"success":false,"error":"Unknown platform: '"$(json_escape "$PLATFORM")"'. Use: spotify, youtube, tiktok, podcast, cd, archive, web, mp3"}'
         exit 1
         ;;
 esac
 
 if [ -f "$OUT" ]; then
     SIZE=$(stat --format=%s "$OUT" 2>/dev/null || stat -f%z "$OUT" 2>/dev/null)
-    SIZE_MB=$(echo "scale=2; $SIZE / 1048576" | bc 2>/dev/null || echo "unknown")
-    echo "{\"success\":true,\"platform\":\"$PLATFORM\",\"output\":\"$OUT\",\"size_mb\":$SIZE_MB}"
+    # awk, not bc: Git Bash ships without bc. null, not a bare word, on failure.
+    SIZE_MB=$(awk -v s="$SIZE" 'BEGIN { printf "%.2f", s / 1048576 }' 2>/dev/null) || SIZE_MB=null
+    echo "{\"success\":true,\"platform\":\"$PLATFORM\",\"output\":\"$(json_escape "$OUT")\",\"size_mb\":${SIZE_MB:-null}}"
 else
     echo '{"success":false,"error":"Export failed — output not created"}'
     exit 1
