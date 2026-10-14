@@ -306,7 +306,10 @@ def transcribe(y, start, language):
         except ImportError:
             from faster_whisper import WhisperModel
             model = WhisperModel(WHISPER_FASTER)
-            found, info = model.transcribe(path, word_timestamps=True, language=language,
+            # The 16 kHz array, not the path: faster-whisper 1.2.1 opens files
+            # with av.open(metadata_errors=...), which PyAV 14+ rejects
+            found, info = model.transcribe(y.astype("float32"), word_timestamps=True,
+                                           language=language,
                                            condition_on_previous_text=False)
             segments = [{"start": s.start, "end": s.end, "text": s.text,
                          "words": [{"word": w.word, "start": w.start, "end": w.end}
