@@ -24,7 +24,14 @@ fi
 # The server reads its stdin from a pipe whose write end only this shell
 # holds. However this shell ends (Ctrl-C, kill -9, a closed terminal), the
 # pipe closes and the server shuts itself down instead of keeping the port.
-exec {KEEPALIVE}> >(exec "$PYTHON" "$WEBAPP_DIR/server.py" --port "$PORT" --exit-with-stdin)
+# Needs bash 4.4+ ($! for a process substitution). macOS ships 3.2, where the
+# plain background job below is enough: the trap reaches a native child there.
+if [ "${BASH_VERSINFO[0]}" -gt 4 ] ||
+   { [ "${BASH_VERSINFO[0]}" -eq 4 ] && [ "${BASH_VERSINFO[1]}" -ge 4 ]; }; then
+    exec 3> >(exec "$PYTHON" "$WEBAPP_DIR/server.py" --port "$PORT" --exit-with-stdin)
+else
+    "$PYTHON" "$WEBAPP_DIR/server.py" --port "$PORT" &
+fi
 SERVER_PID=$!
 trap 'kill "$SERVER_PID" 2>/dev/null || true' INT TERM EXIT
 
