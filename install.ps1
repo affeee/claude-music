@@ -1,6 +1,6 @@
 # claude-music - Windows Installer (PowerShell)
-# Port of install.sh for Windows users. Requires PowerShell 5.1+ and Developer Mode
-# (or Administrator) for symlink creation.
+# Port of install.sh for Windows users. Requires PowerShell 5.1+. Uses symlinks
+# with Developer Mode or Administrator, directory junctions otherwise.
 #
 # Run with:    powershell -ExecutionPolicy Bypass -File .\install.ps1
 #
@@ -9,7 +9,7 @@
 #   2. Finds or installs ACE-Step 1.5
 #   3. Downloads model checkpoints (optional)
 #   4. Updates config.json with your ACE-Step path
-#   5. Creates symlinks in %USERPROFILE%\.claude\skills\
+#   5. Links the skills into %USERPROFILE%\.claude\skills\
 
 $ErrorActionPreference = "Stop"
 
@@ -47,8 +47,10 @@ else { Write-Err "git not found. Install from https://git-scm.com/download/win";
 $pyCmd = $null
 foreach ($c in @("python", "python3", "py")) {
     if (Test-Command $c) {
-        $ver = & $c --version 2>&1
-        if ($LASTEXITCODE -eq 0) { $pyCmd = $c; Write-Ok "Python: $ver (via '$c')"; break }
+        # The Microsoft Store alias stub is on PATH but only prints an install
+        # hint to stderr, which $ErrorActionPreference = "Stop" turns into a throw.
+        try { $ver = & $c --version 2>&1 } catch { continue }
+        if ($LASTEXITCODE -eq 0 -and "$ver" -match '^Python 3') { $pyCmd = $c; Write-Ok "Python: $ver (via '$c')"; break }
     }
 }
 if (-not $pyCmd) { Write-Err "Python 3.10+ not found. Install from https://www.python.org/"; exit 1 }
@@ -169,24 +171,35 @@ if ($hasTurbo) {
 }
 
 # ----------------------------------------------------------------------
-# 5. Symlinks (requires Developer Mode or Admin)
+# 5. Symlinks (Developer Mode or Admin), else junctions, else copies
 # ----------------------------------------------------------------------
-Write-Step "5/6" "Creating skill symlinks..."
+Write-Step "5/6" "Linking skills..."
 if (-not (Test-Path $TARGET_DIR)) { New-Item -ItemType Directory -Force -Path $TARGET_DIR | Out-Null }
 
 $skillDirs = Get-ChildItem -Path $SKILLS_DIR -Directory | Where-Object { $_.Name -like "claude-music*" }
 foreach ($s in $skillDirs) {
     $link = Join-Path $TARGET_DIR $s.Name
-    if (Test-Path $link) {
-        Remove-Item $link -Force -Recurse -ErrorAction SilentlyContinue
+    # Get-Item, not Test-Path: Test-Path is false for a dangling symlink.
+    $existing = Get-Item $link -Force -ErrorAction SilentlyContinue
+    if ($existing) {
+        # Remove-Item -Recurse on a directory symlink in PowerShell 5.1 deletes
+        # the target's contents (this repo). Delete() removes only the link.
+        if ($existing.LinkType) { $existing.Delete() }
+        else { Remove-Item $link -Force -Recurse -ErrorAction SilentlyContinue }
     }
     try {
         New-Item -ItemType SymbolicLink -Path $link -Target $s.FullName -ErrorAction Stop | Out-Null
         Write-Ok "Linked $($s.Name)"
     } catch {
-        Write-Warn "Symlink failed for $($s.Name). Falling back to copy."
-        Copy-Item -Path $s.FullName -Destination $link -Recurse -Force
-        Write-Ok "Copied $($s.Name) (note: edits won't auto-sync - re-run installer after changes)"
+        # Junctions need no Developer Mode or Admin and still stay live.
+        try {
+            New-Item -ItemType Junction -Path $link -Target $s.FullName -ErrorAction Stop | Out-Null
+            Write-Ok "Linked $($s.Name) (junction)"
+        } catch {
+            Write-Warn "Symlink and junction failed for $($s.Name). Falling back to copy."
+            Copy-Item -Path $s.FullName -Destination $link -Recurse -Force
+            Write-Ok "Copied $($s.Name) (note: edits won't auto-sync - re-run installer after changes)"
+        }
     }
 }
 
