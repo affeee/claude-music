@@ -2,6 +2,7 @@
   "ace_step_dir": "CHANGE_ME",
   "checkpoint_dir": "CHANGE_ME",
   "output_dir": "~/Music/claude-music-output",
+  "voices_dir": "~/Music/claude-music-voices",
   "defaults": {
     "quality": "high",
     "format": "flac",

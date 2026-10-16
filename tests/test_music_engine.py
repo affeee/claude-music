@@ -18,6 +18,7 @@ import ast
 import io
 import json
 import subprocess
+import sys
 import uuid
 from contextlib import redirect_stdout
 from pathlib import Path, PureWindowsPath
@@ -717,3 +718,242 @@ def test_listen_has_no_heavy_imports_at_module_level(scripts_dir):
 ])
 def test_is_diffusion_bar(engine_module, desc, total, expected, hit):
     assert engine_module.is_diffusion_bar(desc, total, expected) is hit
+
+
+# ---------------------------------------------------------------------------
+# (j) Vocal flow: structure, clean, boost, voice profiles, orchestrator
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(scope="module")
+def structure(_scripts_importable):
+    import music_structure
+    return music_structure
+
+
+@pytest.fixture(scope="module")
+def vocals(_scripts_importable):
+    import music_vocals
+    return music_vocals
+
+
+def test_estimate_key_finds_c_minor(structure):
+    # The C minor profile itself must score as C minor, and rotated to A as A minor.
+    key, conf = structure.estimate_key(list(structure.MINOR_PROFILE))
+    assert key == "C minor" and conf > 0.99
+    rotated = structure.MINOR_PROFILE[-9:] + structure.MINOR_PROFILE[:-9]
+    assert structure.estimate_key(rotated)[0] == "A minor"
+
+
+def test_find_drop_skips_the_beat_entering_a_quiet_intro(structure):
+    """Affe - Boo: quiet pad, beat in at ~15 s (+6 dB), drop at ~56 s onto the
+    loud plateau. The beat entry is the bigger relative jump from silence-ish
+    levels but does not reach the plateau, so it must not count."""
+    hop = structure.RMS_HOP_SEC
+    curve = [-34.0] * int(15 / hop) + [-22.0] * int(41 / hop) + [-12.5] * int(120 / hop)
+    assert structure.find_drop(curve) == pytest.approx(56.0, abs=hop)
+
+
+def test_find_drop_returns_none_without_a_rise(structure):
+    assert structure.find_drop([-12.0] * 300) is None
+    assert structure.find_drop([-12.0] * 3) is None
+
+
+def test_snap_to_beat(structure):
+    assert structure.snap_to_beat(56.1, 14.63, 129.2) == pytest.approx(55.96, abs=0.01)
+    assert structure.snap_to_beat(None, 0.0, 120) is None
+
+
+def test_structure_has_no_heavy_imports_at_module_level(scripts_dir):
+    tree = ast.parse((scripts_dir / "music_structure.py").read_text())
+    top = {n.names[0].name.split(".")[0] for n in tree.body if isinstance(n, ast.Import)}
+    top |= {n.module.split(".")[0] for n in tree.body if isinstance(n, ast.ImportFrom)}
+    assert not top & {"numpy", "librosa", "soundfile"}
+
+
+def test_mix_boost_lifts_the_layer_from_the_drop(engine_module):
+    cmd = engine_module.build_mix_command("s.mp3", "l.flac", "o.flac", 0.0, 14.63, -1.0,
+                                          boost_at=55.96, boost_db=5.0)
+    graph = cmd[cmd.index("-filter_complex") + 1]
+    assert "eval=frame" in graph
+    assert "lt(t,55.46)" in graph and "lt(t,55.96)" in graph, "ramp ends at the drop"
+    assert "1.778279" in graph, "+5 dB"
+    assert "0.707946" in graph, "-3 dB headroom kept"
+    assert "afade=t=in:st=14.58" in graph
+
+
+def test_mix_without_boost_is_unchanged(engine_module):
+    plain = engine_module.build_mix_command("s", "l", "o", -2.0)
+    assert plain == engine_module.build_mix_command("s", "l", "o", -2.0, boost_at=None,
+                                                    boost_db=5.0)
+    assert plain == engine_module.build_mix_command("s", "l", "o", -2.0, boost_at=50.0,
+                                                    boost_db=0.0)
+
+
+def test_clean_script_is_deterministic_and_safe(scripts_dir):
+    src = (scripts_dir / "music_clean.sh").read_text()
+    assert "--shifts 0" in src, "Demucs' random shift makes two runs differ"
+    assert '"demucs==4.0.1"' in src and '"torch==2.5.1"' in src, "pinned for repeatable output"
+    assert "ffmpeg -n" in src
+    assert "-d mps" not in src, "MPS fails inside Demucs"
+
+
+def test_lego_parser_has_flow_flags(engine_module):
+    args = engine_module.build_parser().parse_args(
+        ["lego", "--src-audio", "x.mp3", "--clean", "--voice", "aria",
+         "--mix-boost-at", "55.96", "--mix-boost", "5"])
+    assert args.clean is True and args.voice == "aria"
+    assert args.mix_boost_at == 55.96 and args.mix_boost == 5.0
+    unset = engine_module.build_parser().parse_args(["lego", "--src-audio", "x.mp3"])
+    assert unset.clean is None and unset.mix_gain is None and unset.mix_boost is None
+
+
+def _write_profile(tmp_path, name="aria", **post):
+    d = tmp_path / name
+    d.mkdir()
+    (d / "profile.json").write_text(json.dumps({
+        "name": name.title(),
+        "lego": {"caption": "airy female vocal", "seed": 20261016,
+                 "inference_steps": 50, "track": "vocals"},
+        "post": {"clean": True, "mix_gain_db": 0.0, "boost_db": 5.0, **post},
+        "lyrics": {"intro_line": "Ooh, ooh"},
+    }))
+    return d
+
+
+def test_voice_profile_fills_only_unset_values(engine_module, tmp_path):
+    _write_profile(tmp_path)
+    profile = engine_module.load_voice_profile("aria", base_dir=tmp_path)
+    args = engine_module.build_parser().parse_args(["lego", "--src-audio", "x.mp3"])
+    engine_module.apply_voice_profile(args, profile)
+    assert (args.caption, args.seed, args.inference_steps, args.track) == (
+        "airy female vocal", 20261016, 50, "vocals")
+    assert args.clean is True and args.mix_gain == 0.0 and args.mix_boost == 5.0
+
+    args = engine_module.build_parser().parse_args(
+        ["--seed", "7", "lego", "--src-audio", "x.mp3", "--caption", "mine",
+         "--no-clean", "--mix-boost", "2"])
+    engine_module.apply_voice_profile(args, profile)
+    assert (args.caption, args.seed, args.clean, args.mix_boost) == ("mine", 7, False, 2.0)
+
+
+@pytest.mark.parametrize("name", ["../etc", "Aria/x", "", "a" * 60, "ari a"])
+def test_voice_profile_rejects_unsafe_names(engine_module, tmp_path, name):
+    with pytest.raises(ValueError):
+        engine_module.load_voice_profile(name, base_dir=tmp_path)
+
+
+def test_voice_profile_missing(engine_module, tmp_path):
+    with pytest.raises(ValueError, match="no voice profile"):
+        engine_module.load_voice_profile("nobody", base_dir=tmp_path)
+
+
+def test_intro_line_only_when_starting_mid_song(vocals):
+    lyr = "[Verse]\nCity lights"
+    assert vocals.with_intro_line(lyr, "Ooh, ooh", 14.63).startswith("[Intro]\nOoh, ooh\n\n[Verse]")
+    assert vocals.with_intro_line(lyr, "Ooh, ooh", 0) == lyr
+    assert vocals.with_intro_line(lyr, None, 14.63) == lyr
+    has_intro = "[Intro]\nMmm\n\n[Verse]\nx"
+    assert vocals.with_intro_line(has_intro, "Ooh, ooh", 14.63) == has_intro
+
+
+def test_resolve_time(vocals):
+    assert vocals.resolve_time("auto", 55.96) == 55.96
+    assert vocals.resolve_time(None, 14.63) == 14.63
+    assert vocals.resolve_time("none", 55.96) is None
+    assert vocals.resolve_time("30", 55.96) == 30.0
+
+
+def test_last_json_skips_log_noise(vocals):
+    assert vocals.last_json('noise\n{"a": 1}') == {"a": 1}
+    assert vocals.last_json('{\n  "a": {"b": 2}\n}') == {"a": {"b": 2}}
+    assert vocals.last_json("no json here") is None
+
+
+def test_vocals_is_stdlib_only(scripts_dir):
+    tree = ast.parse((scripts_dir / "music_vocals.py").read_text())
+    top = {n.names[0].name.split(".")[0] for n in tree.body if isinstance(n, ast.Import)}
+    top |= {n.module.split(".")[0] for n in tree.body if isinstance(n, ast.ImportFrom)}
+    assert top <= set(sys.stdlib_module_names)
+
+
+def test_every_generation_config_honours_seed(engine_source):
+    """Regression: lego/extract/complete passed --seed in GenerationParams but
+    left GenerationConfig.use_random_seed at ACE-Step's default (True), so the
+    seed was silently replaced by a random one and runs could not be repeated."""
+    tree = ast.parse(engine_source)
+    calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call)
+             and getattr(n.func, "id", None) == "GenerationConfig"]
+    assert len(calls) == 6
+    for call in calls:
+        assert "use_random_seed" in {k.arg for k in call.keywords}, ast.unparse(call)
+
+
+def test_voice_profile_reference_audio_is_relative_to_profile(engine_module, tmp_path):
+    d = _write_profile(tmp_path)
+    data = json.loads((d / "profile.json").read_text())
+    data["lego"]["reference_audio"] = "reference.wav"
+    (d / "profile.json").write_text(json.dumps(data))
+    profile = engine_module.load_voice_profile("aria", base_dir=tmp_path)
+    args = engine_module.build_parser().parse_args(["lego", "--src-audio", "x.mp3"])
+    engine_module.apply_voice_profile(args, profile)
+    assert args.reference_audio == str(d / "reference.wav")
+    args = engine_module.build_parser().parse_args(
+        ["lego", "--src-audio", "x.mp3", "--reference-audio", "/mine.wav"])
+    engine_module.apply_voice_profile(args, profile)
+    assert args.reference_audio == "/mine.wav"
+
+
+def test_voice_profile_lora_resolves_and_cli_wins(engine_module, tmp_path):
+    d = _write_profile(tmp_path)
+    data = json.loads((d / "profile.json").read_text())
+    data["lego"].update(lora="adapter", lora_scale=0.8)
+    (d / "profile.json").write_text(json.dumps(data))
+    profile = engine_module.load_voice_profile("aria", base_dir=tmp_path)
+    args = engine_module.build_parser().parse_args(["lego", "--src-audio", "x.mp3"])
+    engine_module.apply_voice_profile(args, profile)
+    assert args.lora == str(d / "adapter") and args.lora_scale == 0.8
+    args = engine_module.build_parser().parse_args(
+        ["lego", "--src-audio", "x.mp3", "--lora", "/other", "--lora-scale", "0.5"])
+    engine_module.apply_voice_profile(args, profile)
+    assert args.lora == "/other" and args.lora_scale == 0.5
+
+
+def test_voice_adapter_on_mlx_merges_lokr(engine_module, tmp_path, monkeypatch):
+    """On MLX the adapter must be merged into the weights: the PyTorch
+    fallback needed >18 GB and froze a 16 GB Mac (watchdog panic)."""
+    lokr = tmp_path / "ck"
+    lokr.mkdir()
+    (lokr / "lokr_weights.safetensors").write_bytes(b"x")
+    calls = []
+    monkeypatch.setattr(engine_module, "merge_lokr_into_mlx",
+                        lambda h, w, s: calls.append((w, s)) or "✅ merged")
+
+    class Mlx:
+        use_mlx_dit = True
+
+        def add_voice_lora(self, *a, **k):
+            raise AssertionError("PyTorch adapter path must not be used on MLX")
+
+    assert engine_module.load_voice_adapter(Mlx(), str(lokr), 0.7) == "✅ merged"
+    assert calls == [(str(lokr / "lokr_weights.safetensors"), 0.7)]
+    peft = tmp_path / "peft"
+    peft.mkdir()
+    assert engine_module.load_voice_adapter(Mlx(), str(peft)).startswith("❌")
+
+
+def test_voice_adapter_without_mlx_uses_acestep_loader(engine_module):
+    class Cuda:
+        use_mlx_dit = False
+
+        def add_voice_lora(self, path, scale=1.0):
+            return f"✅ {path} {scale}"
+
+    assert engine_module.load_voice_adapter(Cuda(), "/a", 0.5) == "✅ /a 0.5"
+
+
+def test_lokr_weights_file(engine_module, tmp_path):
+    f = tmp_path / "lokr_weights.safetensors"
+    f.write_bytes(b"x")
+    assert engine_module.lokr_weights_file(str(tmp_path)) == str(f)
+    assert engine_module.lokr_weights_file(str(f)) == str(f)
+    assert engine_module.lokr_weights_file(str(tmp_path / "nope")) is None

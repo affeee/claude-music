@@ -47,6 +47,13 @@ Requires `claude-video` skill + DeepFilterNet3 weights. <1 GB VRAM.
 Use only when you need to fix vocals/drums/bass/other separately, then remix.
 Not needed for normal enhancement.
 
+**Cleaning a generated vocal layer** (lego bleed: quiet backing, extra drums)
+needs no external skill: `bash ~/.claude/skills/claude-music/scripts/music_clean.sh layer.flac`
+writes `layer_clean.flac` (Demucs `htdemucs_ft` vocals + declick). The vocal
+flow and `lego --clean` run it for you.
+
+For all four stems of a full mix:
+
 ```bash
 source ~/.video-skill/bin/activate
 python3 ~/.claude/skills/claude-video/scripts/audio_enhance.py separate \

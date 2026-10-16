@@ -556,8 +556,29 @@ def task_instruction(task, track=None):
     return named.format(track=track.upper()) if track else default
 
 
+MIX_BOOST_RAMP_SEC = 0.5
+
+
+def layer_volume_filter(layer_gain_db=0.0, boost_at=None, boost_db=0.0):
+    """ffmpeg volume filter for the layer: a fixed gain, optionally lifted
+    by boost_db from boost_at on (e.g. the drop), over a short ramp that
+    ends at boost_at so the lift lands with the drop.
+
+    The -3 dB headroom matches the source side of build_mix_command.
+    """
+    if not boost_at or boost_at <= 0 or not boost_db:
+        return f"volume={layer_gain_db - 3.0:.1f}dB"
+    base = 10 ** ((layer_gain_db - 3.0) / 20)
+    lift = 10 ** (boost_db / 20)
+    t1 = boost_at
+    t0 = max(0.0, t1 - MIX_BOOST_RAMP_SEC)
+    expr = (f"{base:.6f}*if(lt(t,{t0:.2f}),1,"
+            f"if(lt(t,{t1:.2f}),1+(t-{t0:.2f})/{t1 - t0:.2f}*{lift - 1:.6f},{lift:.6f}))")
+    return f"volume='{expr}':eval=frame"
+
+
 def build_mix_command(src_audio, layer, out_path, layer_gain_db=0.0,
-                      start=0.0, end=-1.0):
+                      start=0.0, end=-1.0, boost_at=None, boost_db=0.0):
     """ffmpeg argv that lays a generated layer over the untouched source.
 
     Both inputs drop 3 dB before summing and a limiter catches what is left,
@@ -565,15 +586,17 @@ def build_mix_command(src_audio, layer, out_path, layer_gain_db=0.0,
 
     Outside --start/--end ACE-Step returns the source itself, not silence, so
     the layer is faded to nothing there or the source would be doubled.
+    boost_at/boost_db lift the layer from a point on (see layer_volume_filter).
     """
     fades = ""
     if start and start > 0:
         fades += f",afade=t=in:st={max(0.0, start - 0.05):.2f}:d=0.05"
     if end and end > 0:
         fades += f",afade=t=out:st={end:.2f}:d=0.05"
+    volume = layer_volume_filter(layer_gain_db, boost_at, boost_db)
     graph = (
         "[0:a]aresample=48000,volume=-3dB[src];"
-        f"[1:a]aresample=48000,volume={layer_gain_db - 3.0:.1f}dB{fades}[layer];"
+        f"[1:a]aresample=48000,{volume}{fades}[layer];"
         "[src][layer]amix=inputs=2:normalize=0:duration=first,"
         "alimiter=limit=0.89:level=false[mix]"
     )
@@ -581,12 +604,18 @@ def build_mix_command(src_audio, layer, out_path, layer_gain_db=0.0,
             "-filter_complex", graph, "-map", "[mix]", out_path]
 
 
-def mix_with_source(src_audio, layer, layer_gain_db=0.0, start=0.0, end=-1.0):
-    """Mix a lego layer with its source. Returns the mix path, or None."""
+def mix_with_source(src_audio, layer, layer_gain_db=0.0, start=0.0, end=-1.0,
+                    boost_at=None, boost_db=0.0, out_stem=None):
+    """Mix a lego layer with its source. Returns the mix path, or None.
+
+    out_stem names the mix (default: the layer's own stem), so a mix of the
+    cleaned stem can still sit beside the raw layer as <layer>_mix.
+    """
     if not shutil.which("ffmpeg"):
         log("Warning: ffmpeg not found, skipping --mix")
         return None
     stem, ext = os.path.splitext(layer)
+    stem = out_stem or stem
     out_path = f"{stem}_mix{ext}"
     counter = 2
     while os.path.exists(out_path):
@@ -594,13 +623,184 @@ def mix_with_source(src_audio, layer, layer_gain_db=0.0, start=0.0, end=-1.0):
         counter += 1
     try:
         subprocess.run(build_mix_command(src_audio, layer, out_path, layer_gain_db,
-                                         start, end),
+                                         start, end, boost_at, boost_db),
                        check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
                        text=True)
     except (OSError, subprocess.CalledProcessError) as e:
         log(f"Warning: mix failed ({getattr(e, 'stderr', '') or e}), keeping the layer only")
         return None
     return out_path
+
+
+def clean_layer(layer):
+    """Strip backing bleed from a lego layer via music_clean.sh.
+
+    Returns the clean stem's path, or None (logged) so a failed separation
+    never loses the generated layer.
+    """
+    script = Path(__file__).parent / "music_clean.sh"
+    emit_event("progress", pct=None, stage="Cleaning the layer (Demucs + declick)")
+    log("Cleaning the layer (Demucs + declick, ~3-8 min) ...")
+    try:
+        proc = subprocess.run(["bash", str(script), layer], capture_output=True,
+                              text=True, timeout=3600)
+        result = json.loads(proc.stdout.strip().splitlines()[-1])
+    except (OSError, subprocess.TimeoutExpired, ValueError, IndexError) as e:
+        log(f"Warning: cleaning failed ({e}), keeping the raw layer")
+        return None
+    if not result.get("success"):
+        log(f"Warning: cleaning failed ({result.get('error')}), keeping the raw layer")
+        return None
+    return result["clean_path"]
+
+
+def lokr_weights_file(path):
+    """The lokr_weights.safetensors behind an adapter path, or None (PEFT LoRA)."""
+    p = Path(path)
+    if p.is_file() and p.suffix == ".safetensors":
+        return str(p)
+    candidate = p / "lokr_weights.safetensors"
+    return str(candidate) if candidate.is_file() else None
+
+
+def merge_lokr_into_mlx(handler, weights, scale=1.0):
+    """Bake a LoKr adapter into the DiT weights, then rebuild the MLX copy.
+
+    ACE-Step converts the DiT to MLX once at init, so an adapter loaded into
+    the PyTorch decoder never reaches MLX. Running the adapted PyTorch path
+    instead needed >18 GB on a 16 GB Mac and froze it (watchdog panic). So:
+    drop the MLX copy, inject the LoKr, merge it into the base weights,
+    remove the LyCORIS wrappers again (their keys would break the MLX
+    conversion), and convert afresh. Peak memory matches a normal run.
+    """
+    import gc
+
+    from acestep.core.generation.handler.lora.lifecycle import _load_lokr_adapter
+
+    if getattr(handler, "mlx_decoder", None) is not None:  # built at init: drop it first
+        handler.mlx_decoder = None
+        handler.use_mlx_dit = False
+        gc.collect()
+        with contextlib.suppress(Exception):
+            import mlx.core as mx
+            mx.clear_cache()
+
+    decoder = handler.model.decoder
+    # LyCORIS logs through a StreamHandler bound to sys.stdout at import time,
+    # and stdout is reserved for the result JSON: move it to stderr.
+    import logging
+    for h in logging.getLogger("LyCORIS").handlers:
+        if isinstance(h, logging.StreamHandler) and h.stream is sys.stdout:
+            h.setStream(sys.stderr)
+    with contextlib.redirect_stdout(sys.stderr):
+        net = _load_lokr_adapter(decoder, weights)
+        net.merge_to(scale)
+        net.restore()
+    with contextlib.suppress(AttributeError):
+        del decoder._lycoris_net
+    del net
+    gc.collect()
+    if not handler._init_mlx_dit():
+        return "❌ adapter merged, but the MLX decoder could not be rebuilt"
+    return f"✅ LoKr merged into the DiT (scale {scale}), MLX rebuilt: {weights}"
+
+
+def mlx_available():
+    with contextlib.suppress(Exception):
+        from acestep.models.mlx import mlx_available as _available
+        return bool(_available())
+    return False
+
+
+def load_voice_adapter(handler, path, scale=1.0, mlx=None):
+    """Load a trained voice adapter (LoKr or PEFT LoRA) into an initialized handler.
+
+    On Apple Silicon (MLX diffusion) a LoKr is merged into the weights and
+    the MLX copy rebuilt (merge_lokr_into_mlx). A PEFT LoRA cannot be merged
+    that way and the PyTorch fallback does not fit in unified memory, so it
+    is refused there. Elsewhere ACE-Step's own adapter loading is used.
+    """
+    if mlx is None:
+        mlx = getattr(handler, "use_mlx_dit", False)
+    if mlx:
+        weights = lokr_weights_file(path)
+        if not weights:
+            return ("❌ Only LoKr adapters (lokr_weights.safetensors) can be used on "
+                    "Apple Silicon; PEFT LoRA needs the PyTorch path, which does not fit "
+                    "in unified memory")
+        try:
+            return merge_lokr_into_mlx(handler, weights, scale)
+        except Exception as e:  # report, never leave a half-merged model running
+            return f"❌ LoKr merge failed: {e}"
+    return handler.add_voice_lora(path, scale=scale)
+
+
+# ---------------------------------------------------------------------------
+# Voice profiles
+# ---------------------------------------------------------------------------
+
+DEFAULT_VOICES_DIR = "~/Music/claude-music-voices"
+VOICE_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,47}$")
+
+
+def voices_dir():
+    return os.path.expanduser(load_config().get("voices_dir") or DEFAULT_VOICES_DIR)
+
+
+def load_voice_profile(name, base_dir=None):
+    """Read <voices_dir>/<name>/profile.json. Raises ValueError with a reason."""
+    name = (name or "").strip().lower()
+    if not VOICE_NAME_RE.match(name):
+        raise ValueError(f"invalid voice name {name!r} (use a-z, 0-9 and -)")
+    path = Path(base_dir or voices_dir()) / name / "profile.json"
+    if not path.is_file():
+        raise ValueError(f"no voice profile at {path}")
+    try:
+        profile = json.loads(path.read_text())
+    except (OSError, ValueError) as e:
+        raise ValueError(f"unreadable voice profile {path}: {e}") from e
+    if not isinstance(profile.get("lego"), dict):
+        raise ValueError(f"voice profile {path} has no 'lego' block")
+    profile["_dir"] = str(path.parent)
+    return profile
+
+
+def apply_voice_profile(args, profile):
+    """Fill lego settings the user left unset from a voice profile.
+
+    Explicit CLI values always win; the profile only replaces defaults
+    (empty caption, seed -1, unset steps/track/adapter/reference/clean/mix gain/boost).
+    Relative lego.lora and lego.reference_audio paths resolve against the profile's folder.
+    """
+    lego = profile.get("lego") or {}
+    post = profile.get("post") or {}
+    if not args.caption and lego.get("caption"):
+        args.caption = lego["caption"]
+    if args.seed == -1 and isinstance(lego.get("seed"), int):
+        args.seed = lego["seed"]
+    if args.inference_steps is None and lego.get("inference_steps"):
+        args.inference_steps = int(lego["inference_steps"])
+    if args.track is None and lego.get("track") in TRACK_NAMES:
+        args.track = lego["track"]
+    if args.lora is None and lego.get("lora"):
+        lora = Path(os.path.expanduser(lego["lora"]))
+        if not lora.is_absolute() and profile.get("_dir"):
+            lora = Path(profile["_dir"]) / lora
+        args.lora = str(lora)
+    if args.lora_scale is None and lego.get("lora_scale") is not None:
+        args.lora_scale = float(lego["lora_scale"])
+    if args.reference_audio is None and lego.get("reference_audio"):
+        ref = Path(os.path.expanduser(lego["reference_audio"]))
+        if not ref.is_absolute() and profile.get("_dir"):
+            ref = Path(profile["_dir"]) / ref
+        args.reference_audio = str(ref)
+    if args.clean is None and "clean" in post:
+        args.clean = bool(post["clean"])
+    if args.mix_gain is None and "mix_gain_db" in post:
+        args.mix_gain = float(post["mix_gain_db"])
+    if args.mix_boost is None and "boost_db" in post:
+        args.mix_boost = float(post["boost_db"])
+    return args
 
 
 # ---------------------------------------------------------------------------
@@ -652,6 +852,9 @@ def initialize_acestep(args):
         use_flash_attention=use_flash,
         offload_to_cpu=offload,
         offload_dit_to_cpu=offload_dit,
+        # With an adapter the MLX copy is built once, after the merge
+        # (merge_lokr_into_mlx); building it here too doubles peak memory.
+        use_mlx_dit=not getattr(args, "lora", None),
     )
 
     if not success:
@@ -659,6 +862,14 @@ def initialize_acestep(args):
 
     load_time = time.time() - t0
     log(f"DiT ready in {load_time:.1f}s: {status}")
+
+    lora = getattr(args, "lora", None)
+    if lora:
+        message = load_voice_adapter(handler, lora, getattr(args, "lora_scale", 1.0),
+                                     mlx=mlx_available())
+        if not message.startswith("✅"):
+            return None, None, f"Adapter load failed: {message}"
+        log(message)
 
     llm_handler = None
     if args.lm_model and args.thinking and not task_uses_lm(args):
@@ -1070,6 +1281,7 @@ def cmd_extract(args):
 
     config = GenerationConfig(
         batch_size=1,
+        use_random_seed=(args.seed < 0),
         audio_format=args.format,
     )
 
@@ -1096,7 +1308,8 @@ def cmd_extract(args):
                 path = audio[key]
                 break
         if path and os.path.isfile(path):
-            outputs.append({"path": path, "index": i + 1})
+            outputs.append({"path": path, "index": i + 1,
+                            "seed": audio.get("params", {}).get("seed", -1)})
 
     outputs = rename_outputs(
         args, outputs,
@@ -1117,12 +1330,25 @@ def cmd_extract(args):
 
 def cmd_lego(args):
     """Multi-track / add layer (base model only)."""
+    if args.voice:
+        try:
+            args = apply_voice_profile(args, load_voice_profile(args.voice))
+        except ValueError as e:
+            error_json(f"Voice profile: {e}")
+    args.lora_scale = 1.0 if args.lora_scale is None else args.lora_scale
+    if args.lora and not os.path.exists(args.lora):
+        error_json(f"Voice adapter not found: {args.lora}")
+    args.clean = bool(args.clean)
+    args.mix_gain = args.mix_gain or 0.0
+    args.mix_boost = args.mix_boost or 0.0
     args = resolve_base_quality(args, "lego")
 
     if not args.src_audio:
         error_json("Must provide --src-audio for lego mode")
     if not os.path.isfile(args.src_audio):
         error_json(f"Source audio not found: {args.src_audio}")
+    if args.reference_audio and not os.path.isfile(args.reference_audio):
+        error_json(f"Reference audio not found: {args.reference_audio}")
 
     handler, llm_handler, status = initialize_acestep(args)
     if handler is None:
@@ -1139,6 +1365,7 @@ def cmd_lego(args):
         task_type="lego",
         instruction=task_instruction("lego", args.track),
         src_audio=args.src_audio,
+        reference_audio=args.reference_audio,
         repainting_start=args.start,
         repainting_end=args.end,
         inference_steps=args.inference_steps,
@@ -1148,7 +1375,8 @@ def cmd_lego(args):
         thinking=args.thinking if llm_handler else False,
     )
 
-    config = GenerationConfig(batch_size=1, audio_format=args.format)
+    config = GenerationConfig(batch_size=1, use_random_seed=(args.seed < 0),
+                              audio_format=args.format)
 
     save_dir = os.path.expanduser(args.output_dir)
     os.makedirs(save_dir, exist_ok=True)
@@ -1173,7 +1401,8 @@ def cmd_lego(args):
                 path = audio[key]
                 break
         if path and os.path.isfile(path):
-            outputs.append({"path": path, "index": i + 1})
+            outputs.append({"path": path, "index": i + 1,
+                            "seed": audio.get("params", {}).get("seed", -1)})
 
     outputs = rename_outputs(
         args, outputs,
@@ -1181,19 +1410,41 @@ def cmd_lego(args):
                                      args.track])),
         task_type="lego")
 
+    # The layer carries backing bleed; --clean keeps only the stem
+    t1 = time.time()
+    if args.clean:
+        for out in outputs:
+            clean_path = clean_layer(out["path"])
+            if clean_path:
+                out["clean_path"] = clean_path
+    clean_time = time.time() - t1
+
     # lego returns the new layer alone, not the source with the layer on top
     if args.mix:
         for out in outputs:
-            mix_path = mix_with_source(args.src_audio, out["path"], args.mix_gain,
-                                       args.start, args.end)
+            layer = out.get("clean_path") or out["path"]
+            mix_path = mix_with_source(args.src_audio, layer, args.mix_gain,
+                                       args.start, args.end,
+                                       args.mix_boost_at, args.mix_boost,
+                                       out_stem=os.path.splitext(out["path"])[0])
             if mix_path:
                 out["mix_path"] = mix_path
 
     output_json({
         "success": True, "task_type": "lego",
         "track": args.track,
+        "voice": args.voice,
         "outputs": outputs,
-        "timing": {"generation_sec": round(gen_time, 1)},
+        "settings": {
+            "caption": args.caption, "seed": args.seed, "track": args.track,
+            "inference_steps": args.inference_steps, "start": args.start, "end": args.end,
+            "bpm": args.bpm, "key": args.key, "language": args.language,
+            "reference_audio": args.reference_audio, "lora": args.lora,
+            "lora_scale": args.lora_scale, "clean": args.clean, "mix_gain_db": args.mix_gain,
+            "mix_boost_at": args.mix_boost_at, "mix_boost_db": args.mix_boost,
+        },
+        "timing": {"generation_sec": round(gen_time, 1),
+                   "clean_sec": round(clean_time, 1)},
         "count": len(outputs),
     })
 
@@ -1230,7 +1481,8 @@ def cmd_complete(args):
         shift=args.shift,
     )
 
-    config = GenerationConfig(batch_size=1, audio_format=args.format)
+    config = GenerationConfig(batch_size=1, use_random_seed=(args.seed < 0),
+                              audio_format=args.format)
 
     save_dir = os.path.expanduser(args.output_dir)
     os.makedirs(save_dir, exist_ok=True)
@@ -1255,7 +1507,8 @@ def cmd_complete(args):
                 path = audio[key]
                 break
         if path and os.path.isfile(path):
-            outputs.append({"path": path, "index": i + 1})
+            outputs.append({"path": path, "index": i + 1,
+                            "seed": audio.get("params", {}).get("seed", -1)})
 
     outputs = rename_outputs(
         args, outputs,
@@ -1419,8 +1672,26 @@ def build_parser():
                         help="Where the new layer ends (seconds, -1=end of file)")
     p_lego.add_argument("--mix", action="store_true",
                         help="Also write the layer mixed over the source (<name>_mix)")
-    p_lego.add_argument("--mix-gain", type=float, default=0.0,
-                        help="Layer level in the mix, dB relative to the source")
+    p_lego.add_argument("--mix-gain", type=float, default=None,
+                        help="Layer level in the mix, dB relative to the source (default 0)")
+    p_lego.add_argument("--mix-boost-at", type=float, default=None,
+                        help="Lift the layer from this point on (seconds, e.g. the drop)")
+    p_lego.add_argument("--mix-boost", type=float, default=None,
+                        help="How much to lift it there, dB (default 0)")
+    p_lego.add_argument("--clean", action=argparse.BooleanOptionalAction, default=None,
+                        help="Strip backing bleed from the layer with Demucs + declick "
+                             "(writes <layer>_clean.flac; --mix then uses it)")
+    p_lego.add_argument("--lora", default=None,
+                        help="Trained voice adapter: a PEFT LoRA folder (adapter_config.json) "
+                             "or a LoKr lokr_weights.safetensors")
+    p_lego.add_argument("--lora-scale", type=float, default=None,
+                        help="Adapter strength, 0-1 (default 1)")
+    p_lego.add_argument("--reference-audio", default=None,
+                        help="Timbre reference (e.g. a 30 s clip of the wanted voice). ACE-Step "
+                             "samples 3x10 s from it at random unless it is 30 s or shorter")
+    p_lego.add_argument("--voice", default=None,
+                        help="Voice profile name in voices_dir (e.g. aria): fills caption, "
+                             "seed, steps, track and post-processing you leave unset")
     p_lego.add_argument("--language", default=_lang)
     p_lego.add_argument("--bpm", type=int, default=None)
     p_lego.add_argument("--key", default=None)
