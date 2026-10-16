@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # Helpers sourced by the shell wrappers. Not executable on its own.
 
 # First Python 3 interpreter that actually runs. On Windows, `python3` and
