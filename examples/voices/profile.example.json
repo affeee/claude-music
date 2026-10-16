@@ -9,7 +9,7 @@
     "track": "vocals"
   },
   "post": {
-    "clean": true,
+    "clean": false,
     "mix_gain_db": 0.0,
     "boost_db": 5.0
   },

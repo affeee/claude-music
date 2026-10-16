@@ -957,3 +957,24 @@ def test_lokr_weights_file(engine_module, tmp_path):
     assert engine_module.lokr_weights_file(str(tmp_path)) == str(f)
     assert engine_module.lokr_weights_file(str(f)) == str(f)
     assert engine_module.lokr_weights_file(str(tmp_path / "nope")) is None
+
+
+def test_clean_is_opt_in(vocals):
+    assert vocals.resolve_clean(None, {}) is False
+    assert vocals.resolve_clean(None, {"clean": True}) is True
+    assert vocals.resolve_clean(False, {"clean": True}) is False
+    assert vocals.resolve_clean(True, {}) is True
+
+
+def test_clean_run_rejects_a_folder_without_run_json(vocals, tmp_path, capsys):
+    with pytest.raises(SystemExit):
+        vocals.clean_run(str(tmp_path))
+    assert json.loads(capsys.readouterr().out)["success"] is False
+
+
+def test_clean_run_needs_the_layer(vocals, tmp_path, capsys):
+    (tmp_path / "run.json").write_text(json.dumps(
+        {"source": str(tmp_path / "src.wav"), "files": {"layer": str(tmp_path / "gone.flac")}}))
+    with pytest.raises(SystemExit):
+        vocals.clean_run(str(tmp_path))
+    assert "layer not found" in json.loads(capsys.readouterr().out)["error"]

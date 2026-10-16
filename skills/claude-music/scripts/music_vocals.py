@@ -3,9 +3,15 @@
 
   1. Structure analysis  (music_structure.sh): bpm, key, beat entry, drop
   2. Vocal layer         (music_engine.sh lego): placed from the beat entry
-  3. Clean               (--clean): Demucs + declick, no backing bleed
-  4. Mix                 (--mix): over the untouched original, lifted at the drop
-  5. Listening report    (music_listen.sh) on the clean stem
+  3. Clean               (opt-in, --clean): Demucs + declick, no backing bleed
+  4. Mix                 over the untouched original, lifted at the drop
+                         (the raw layer, or the clean stem with --clean)
+  5. Listening report    (music_listen.sh) on the layer the mix used
+
+Cleaning is off by default: it adds ~5 min per take, and most takes are
+judged and thrown away first. Clean a take worth keeping afterwards with
+--clean-run <run folder>: clean stem, a mix of it beside the raw one and a
+new listening report, using the placement stored in run.json.
 
 Every run gets its own folder with the lyrics used, each step's JSON and a
 run.json manifest holding all settings, so a result can be reproduced.
@@ -13,6 +19,7 @@ run.json manifest holding all settings, so a result can be reproduced.
 Usage:
   music_vocals.py song.mp3 --lyrics lyrics.txt --voice aria
   music_vocals.py song.mp3 --lyrics lyrics.txt --caption "warm male baritone" --seed 7
+  music_vocals.py --clean-run ~/Music/claude-music-output/song-vocals_20261016-181041
 
 One JSON object on stdout. Progress on stderr: NDJSON {"event": "stage", ...}
 lines from this script plus the engine's own --progress events.
@@ -32,7 +39,7 @@ from pathlib import Path
 SCRIPT_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = SCRIPT_DIR.parent / "config.json"
 DEFAULT_VOICES_DIR = "~/Music/claude-music-voices"
-STAGES = ("analyze", "generate", "listen", "done")
+STAGES = ("analyze", "generate", "clean", "listen", "done")
 
 
 def log(msg):
@@ -88,6 +95,13 @@ def resolve_time(value, detected):
     return float(value)
 
 
+def resolve_clean(flag, post):
+    """--clean/--no-clean, else the voice profile's post.clean, else off."""
+    if flag is not None:
+        return flag
+    return bool(post.get("clean", False))
+
+
 def last_json(text):
     """The last JSON object printed on stdout (scripts print exactly one)."""
     text = (text or "").strip()
@@ -135,11 +149,99 @@ def voice_profile(name):
         fail(f"voice profile not found or unreadable: {path}")
 
 
+def listening_report(vocal, src, lyrics_file, run_dir, name, language, bpm, key,
+                     start, mix_gain):
+    stage("listen")
+    cmd = ["bash", str(SCRIPT_DIR / "music_listen.sh"), vocal, "--source", src,
+           "--lyrics", str(lyrics_file), "--language", language,
+           "--bpm", str(bpm), "--mix-gain", str(mix_gain),
+           "--spectrogram", str(run_dir / f"{name}.png")]
+    if key:
+        cmd += ["--key", key]
+    if start:
+        cmd += ["--start", f"{start:.2f}"]
+    return run_json(cmd, run_dir / f"{name}.json")
+
+
+def listen_summary(listen, report):
+    if not (listen and listen.get("success", True) and "lyrics" in listen):
+        return None
+    return {
+        "lines_found": listen["lyrics"].get("lines_found"),
+        "lines_expected": listen["lyrics"].get("lines_expected"),
+        "median_note": (listen.get("pitch") or {}).get("median_note"),
+        "in_key_ratio": (listen.get("pitch") or {}).get("in_key_ratio"),
+        "gaps": (listen.get("activity") or {}).get("gaps"),
+        "report": str(report),
+    }
+
+
+def clean_run(run_dir, no_listen=False):
+    """Clean an earlier run's layer, mix the clean stem and listen again.
+
+    Placement, gain and lift come from run.json, so the clean mix lines up
+    with the raw one. Nothing is overwritten: the clean stem, its mix and
+    listen_clean.json land beside the raw files and run.json gains a
+    "clean" section.
+    """
+    run_dir = Path(os.path.expanduser(run_dir)).resolve()
+    manifest_path = run_dir / "run.json"
+    try:
+        manifest = json.loads(manifest_path.read_text())
+    except (OSError, ValueError) as e:
+        fail(f"not a vocal-flow run folder (run.json unreadable): {e}")
+    files, place = manifest.get("files") or {}, manifest.get("placement") or {}
+    layer, src = files.get("layer"), manifest.get("source")
+    if not layer or not os.path.isfile(layer):
+        fail(f"layer not found: {layer}")
+    if not src or not os.path.isfile(src):
+        fail(f"instrumental not found: {src}")
+    t0 = time.time()
+
+    stage("clean")
+    log("Cleaning the layer (Demucs + declick, ~3-8 min) ...")
+    cleaned = run_json(["bash", str(SCRIPT_DIR / "music_clean.sh"), layer], run_dir / "clean.json")
+    clean = cleaned.get("clean_path") if cleaned.get("success") else None
+    if not clean:
+        fail("cleaning failed", detail=cleaned, run_dir=str(run_dir))
+
+    # Same mix as the engine's --mix, from the clean stem; it lands as
+    # <layer>_clean_mix beside the raw <layer>_mix (stdlib import, kept lazy)
+    sys.path.insert(0, str(SCRIPT_DIR))
+    from music_engine import mix_with_source
+    start = place.get("start") or 0.0
+    mix = mix_with_source(src, clean, place.get("mix_gain_db") or 0.0, start, -1.0,
+                          place.get("boost_at"), place.get("boost_db") or 0.0)
+
+    listen = None
+    if not no_listen and files.get("lyrics"):
+        listen = listening_report(clean, src, files["lyrics"], run_dir, "listen_clean",
+                                  (manifest.get("args") or {}).get("language", "en"),
+                                  place.get("bpm"), place.get("key"), start,
+                                  place.get("mix_gain_db") or 0.0)
+
+    section = {"files": {"clean": clean, "mix": mix},
+               "warnings": [] if mix else ["mix failed"],
+               "minutes": round((time.time() - t0) / 60, 1),
+               "created": datetime.now().isoformat(timespec="seconds")}
+    if listen_summary(listen, run_dir / "listen_clean.json"):
+        section["listen"] = listen_summary(listen, run_dir / "listen_clean.json")
+    manifest["clean"] = section
+    manifest_path.write_text(json.dumps(manifest, indent=2))
+    stage("done", run_dir=str(run_dir))
+    print(json.dumps({"success": True, "run_dir": str(run_dir), **section}, indent=2))
+
+
 def main():
     cfg = load_config()
     p = argparse.ArgumentParser(description="Sing over an existing instrumental, end to end")
-    p.add_argument("src", help="The instrumental (left untouched)")
-    p.add_argument("--lyrics", required=True, help="Lyrics file with [Verse]/[Chorus] tags")
+    p.add_argument("src", nargs="?", help="The instrumental (left untouched)")
+    p.add_argument("--lyrics", help="Lyrics file with [Verse]/[Chorus] tags (required with src)")
+    p.add_argument("--clean", action=argparse.BooleanOptionalAction, default=None,
+                   help="Strip backing bleed (Demucs + declick, ~5 min) before mixing "
+                        "(default: voice profile's post.clean, else off)")
+    p.add_argument("--clean-run", metavar="RUN_DIR",
+                   help="Clean an earlier run instead: clean stem, its mix and a new report")
     p.add_argument("--voice", help="Voice profile (e.g. aria) for caption, seed and post settings")
     p.add_argument("--caption", help="Vocal description (overrides the voice profile)")
     p.add_argument("--seed", type=int, help="Seed (overrides the voice profile)")
@@ -159,6 +261,13 @@ def main():
     p.add_argument("--no-listen", action="store_true", help="Skip the listening report")
     p.add_argument("--output-dir", default=cfg.get("output_dir") or "~/Music/claude-music-output")
     args = p.parse_args()
+
+    if args.clean_run:
+        if args.src:
+            p.error("--clean-run takes no instrumental")
+        return clean_run(args.clean_run, args.no_listen)
+    if not args.src or not args.lyrics:
+        p.error("the instrumental and --lyrics are required")
 
     src = os.path.abspath(os.path.expanduser(args.src))
     if not os.path.isfile(src):
@@ -188,6 +297,7 @@ def main():
     boost_at = resolve_time(args.boost_at, structure.get("drop_sec"))
     boost = args.boost if args.boost is not None else post.get("boost_db", 5.0)
     mix_gain = args.mix_gain if args.mix_gain is not None else post.get("mix_gain_db", 0.0)
+    clean = resolve_clean(args.clean, post)
     if boost_at is not None and start and boost_at <= start:
         boost_at = None  # a lift before the vocal starts would just be a louder vocal
     bpm = int(round(structure["bpm"]))
@@ -198,7 +308,8 @@ def main():
     lyrics_file = run_dir / "lyrics.txt"
     lyrics_file.write_text(lyrics)
 
-    # 2-4. Generate, clean, mix (one engine run)
+    # 2-4. Generate, (clean,) mix: one engine run. --clean/--no-clean is always
+    # passed, or the engine would take post.clean from the voice profile itself
     stage("generate", start=start, boost_at=boost_at, bpm=bpm, key=key)
     engine = ["bash", str(SCRIPT_DIR / "music_engine.sh"), "--quality", args.quality,
               "--progress", "--output-dir", str(run_dir)]
@@ -206,7 +317,7 @@ def main():
         engine += ["--seed", str(args.seed)]
     if args.offload:
         engine += ["--offload", args.offload]
-    engine += ["lego", "--src-audio", src, "--track", "vocals", "--clean", "--mix",
+    engine += ["lego", "--src-audio", src, "--track", "vocals", "--clean" if clean else "--no-clean", "--mix",
                "--lyrics", lyrics, "--language", args.language,
                "--bpm", str(bpm), "--mix-gain", str(mix_gain)]
     if key:
@@ -227,19 +338,11 @@ def main():
     out = result["outputs"][0]
     vocal = out.get("clean_path") or out["path"]
 
-    # 5. Listening report
+    # 5. Listening report (on a raw layer, pitch and balance include the bleed)
     listen = None
     if not args.no_listen:
-        stage("listen")
-        cmd = ["bash", str(SCRIPT_DIR / "music_listen.sh"), vocal, "--source", src,
-               "--lyrics", str(lyrics_file), "--language", args.language,
-               "--bpm", str(bpm), "--mix-gain", str(mix_gain),
-               "--spectrogram", str(run_dir / "listen.png")]
-        if key:
-            cmd += ["--key", key]
-        if start:
-            cmd += ["--start", f"{start:.2f}"]
-        listen = run_json(cmd, run_dir / "listen.json")
+        listen = listening_report(vocal, src, lyrics_file, run_dir, "listen", args.language,
+                                  bpm, key, start, mix_gain)
 
     summary = {
         "success": True,
@@ -249,22 +352,15 @@ def main():
         "files": {"layer": out["path"], "clean": out.get("clean_path"),
                   "mix": out.get("mix_path"), "lyrics": str(lyrics_file)},
         "placement": {"start": start, "boost_at": boost_at, "boost_db": boost,
-                      "mix_gain_db": mix_gain, "bpm": bpm, "key": key},
+                      "mix_gain_db": mix_gain, "bpm": bpm, "key": key, "clean": clean},
         "engine_settings": result.get("settings"),
         "warnings": [w for w, bad in (
-            ("cleaning failed, the mix uses the raw layer", not out.get("clean_path")),
+            ("cleaning failed, the mix uses the raw layer", clean and not out.get("clean_path")),
             ("mix failed", not out.get("mix_path"))) if bad],
         "minutes": round((time.time() - t0) / 60, 1),
     }
-    if listen and listen.get("success", True) and "lyrics" in listen:
-        summary["listen"] = {
-            "lines_found": listen["lyrics"].get("lines_found"),
-            "lines_expected": listen["lyrics"].get("lines_expected"),
-            "median_note": (listen.get("pitch") or {}).get("median_note"),
-            "in_key_ratio": (listen.get("pitch") or {}).get("in_key_ratio"),
-            "gaps": (listen.get("activity") or {}).get("gaps"),
-            "report": str(run_dir / "listen.json"),
-        }
+    if listen_summary(listen, run_dir / "listen.json"):
+        summary["listen"] = listen_summary(listen, run_dir / "listen.json")
     (run_dir / "run.json").write_text(json.dumps({
         **summary, "args": vars(args), "repo_commit": git_commit(),
         "created": datetime.now().isoformat(timespec="seconds")}, indent=2))
