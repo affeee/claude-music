@@ -705,6 +705,50 @@ def merge_lokr_into_mlx(handler, weights, scale=1.0):
     return f"✅ LoKr merged into the DiT (scale {scale}), MLX rebuilt: {weights}"
 
 
+def pin_torch_dit_to_cpu(handler):
+    """Keep the PyTorch DiT decoder on CPU while MLX runs the diffusion.
+
+    ACE-Step moves the whole PyTorch model to MPS around each diffusion and,
+    with CPU offload on, back to CPU afterwards, although the decoder (the
+    bulk of it) is unused when MLX diffuses: only the condition encoder is
+    needed. On a 16 GB Mac that copy-back pushed swap past 20 GB on a lego
+    run with a voice adapter (2026-10-16), and with offload off the resident
+    copy ran MPS out of memory. Every move now skips the decoder, which is
+    parked on CPU once, and the rest (encoder, tokenizers: ~0.8B params) is
+    never moved back: its copy-back alone still added ~5 GB swap. Returns
+    True when the pin is active.
+    """
+    if not (getattr(handler, "use_mlx_dit", False) and getattr(handler, "mlx_decoder", None) is not None):
+        return False
+    model = getattr(handler, "model", None)
+    if model is None or not hasattr(model, "decoder"):
+        return False
+    original = handler._recursive_to_device
+
+    def move(target, device, dtype=None):
+        if target is not model:
+            return original(target, device, dtype)
+        dev = torch_device(device)
+        if dev.type == "cpu":  # the copy-back itself is the swap spike: stay put
+            return None
+        for name, child in model.named_children():
+            if name != "decoder":
+                original(child, device, dtype)
+        for t in list(model.parameters(recurse=False)) + list(model.buffers(recurse=False)):
+            t.data = t.data.to(device=dev, dtype=dtype if dtype is not None and t.is_floating_point() else None)
+        return None
+
+    handler._recursive_to_device = move
+    original(model.decoder, "cpu")
+    handler._release_system_memory()
+    return True
+
+
+def torch_device(device):
+    import torch
+    return torch.device(device) if isinstance(device, str) else device
+
+
 def mlx_available():
     with contextlib.suppress(Exception):
         from acestep.models.mlx import mlx_available as _available
@@ -870,6 +914,8 @@ def initialize_acestep(args):
         if not message.startswith("✅"):
             return None, None, f"Adapter load failed: {message}"
         log(message)
+    if pin_torch_dit_to_cpu(handler):
+        log("PyTorch DiT decoder kept on CPU (MLX runs the diffusion)")
 
     llm_handler = None
     if args.lm_model and args.thinking and not task_uses_lm(args):

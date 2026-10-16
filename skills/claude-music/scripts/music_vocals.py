@@ -152,6 +152,8 @@ def main():
     p.add_argument("--mix-gain", type=float, help="Base vocal level in dB (default: voice profile, else 0)")
     p.add_argument("--steps", type=int, help="Diffusion steps (default: voice profile, else 50)")
     p.add_argument("--quality", default="standard")
+    p.add_argument("--offload", choices=["auto", "on", "off"],
+                   help="Move idle models to CPU (engine default: auto)")
     p.add_argument("--no-intro-line", action="store_true",
                    help="Do not prepend the voice profile's throwaway [Intro] line")
     p.add_argument("--no-listen", action="store_true", help="Skip the listening report")
@@ -202,6 +204,8 @@ def main():
               "--progress", "--output-dir", str(run_dir)]
     if args.seed is not None:
         engine += ["--seed", str(args.seed)]
+    if args.offload:
+        engine += ["--offload", args.offload]
     engine += ["lego", "--src-audio", src, "--track", "vocals", "--clean", "--mix",
                "--lyrics", lyrics, "--language", args.language,
                "--bpm", str(bpm), "--mix-gain", str(mix_gain)]

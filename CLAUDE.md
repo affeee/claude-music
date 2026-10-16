@@ -83,6 +83,7 @@ claude-music/
 - `initialize_acestep()` defaults `ACESTEP_GENERATION_TIMEOUT` to 3600 (21600 with no CUDA/MPS, where it also uses every logical core); ACE-Step's own 600s cuts off base-model runs on full-length tracks
 - `--progress` step events find the diffusion bar by its "diffusion" label, or, for the base model's unlabelled bar, by a total equal to `inference_steps` (`is_diffusion_bar()`)
 - Unified memory (Apple Silicon) is handled in the engine, not in presets: `apply_memory_policy()` caps a preset's batch, `auto_offload()` picks offload per job, `fit_lm_to_memory()` swaps or skips an LM that ACE-Step does not list for the tier, `lm_backend()` returns `mlx`. Explicit `--batch` / `--offload` / config values always win. The numbers come from the runs in `references/apple-silicon.md`; re-measure before changing them
+- `pin_torch_dit_to_cpu()` runs after init whenever MLX does the diffusion: the PyTorch decoder is parked on CPU and never moved, and the rest of the model is never copied back to CPU. ACE-Step's copy-back after diffusion pushed swap past 20 GB on a 16 GB Mac (lego + voice adapter, 2026-10-16); with it the copy-back takes under 1 s. `music_vocals.py --offload` passes through to the engine
 - `--progress` silences tqdm and emits `step` events from the real diffusion loop (`track_diffusion_steps()`); `diffusion_pct()` overrides ACE-Step's time-based estimate inside `DIFFUSION_PCT_RANGE`
 
 ### Testing
