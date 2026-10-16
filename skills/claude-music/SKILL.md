@@ -32,7 +32,7 @@ allowed-tools:
 | `/music repaint` | Edit a specific section of a song |
 | `/music extract` | Separate tracks/stems (base model only) |
 | `/music lego` | Add instrument layer (base model only) |
-| `/music vocals` | Sing over an existing instrumental, end to end (analysis, vocal, clean, mix, listen) |
+| `/music vocals` | Sing over an existing instrumental, end to end (analysis, vocal, mix, listen; cleaning is a later, optional step) |
 | `/music complete` | Continue/extend audio (base model only) |
 | `/music compose` | Songwriting: craft caption + lyrics + params |
 | `/music analyze` | BPM, key, loudness, duration analysis |
@@ -122,18 +122,20 @@ bash ~/.claude/skills/claude-music/scripts/music_vocals.sh "$SRC" \
 # or without a voice profile:
 bash ~/.claude/skills/claude-music/scripts/music_vocals.sh "$SRC" \
   --lyrics lyrics.txt --caption "warm male baritone, clear diction" --seed 7
+# later, for a take worth keeping: clean it, mix the clean stem, listen again
+bash ~/.claude/skills/claude-music/scripts/music_vocals.sh --clean-run "$RUN_DIR"
 ```
 
 1. **Structure** (`music_structure.sh`): bpm, key, beat entry (`first_beat_sec`), drop (`drop_sec`, the largest rise onto the loud plateau).
 2. **Vocal layer** (`music_engine.sh lego --track vocals`) from the beat entry. When it starts mid-song, the voice profile's throwaway `[Intro]` line ("Ooh, ooh") is prepended; without it the model tends to drop the first lyric line.
-3. **Clean** (`--clean` → `music_clean.sh`): the lego layer carries quiet backing and extra drums. Demucs `htdemucs_ft` (two stems, `--shifts 0`, pinned versions, CPU on Apple Silicon) keeps the voice, then ffmpeg `adeclick` removes faint clicks. ~3-8 min.
-4. **Mix** (`--mix`): the clean stem over the original; base level `--mix-gain`, lifted by `--boost` dB (default 5) from the drop with a 0.5 s ramp, so the vocal holds up against the full-energy part.
-5. **Listening report** on the clean stem (see below).
+3. **Clean: off by default.** The lego layer carries quiet backing and extra drums; `music_clean.sh` (Demucs `htdemucs_ft`, two stems, `--shifts 0`, pinned versions, CPU on Apple Silicon, then ffmpeg `adeclick`) keeps only the voice. It costs ~5 min per take, so the first pass skips it and the user judges the take from the raw mix. Offer `--clean-run <run folder>` for a take they want to keep: it cleans the stored layer, writes `<layer>_clean_mix` beside the raw mix with the same placement from `run.json`, writes `listen_clean.json`, and adds a `clean` section to `run.json`. `--clean` cleans in the first pass instead (or `post.clean: true` in a voice profile).
+4. **Mix**: the raw layer (the clean stem with `--clean`) over the original; base level `--mix-gain`, lifted by `--boost` dB (default 5) from the drop with a 0.5 s ramp, so the vocal holds up against the full-energy part. The raw mix carries the bleed: faint doubled drums and backing.
+5. **Listening report** on the layer the mix used (see below). On a raw layer the transcript holds up, but pitch and balance include the bleed; trust `listen_clean.json` once the take is cleaned.
 
-Each run gets its own folder `<output_dir>/<song>-vocals_<timestamp>/` with `lyrics.txt` (as sung, intro line included), `structure.json`, `engine.json`, `listen.json`, `listen.png` and `run.json` (every setting plus the repo commit). Rerunning with the same voice, lyrics and seed reproduces the run. Overrides: `--start auto|SEC`, `--boost-at auto|none|SEC`, `--boost DB`, `--mix-gain DB`, `--steps N`, `--no-intro-line`, `--no-listen`.
+Each run gets its own folder `<output_dir>/<song>-vocals_<timestamp>/` with `lyrics.txt` (as sung, intro line included), `structure.json`, `engine.json`, `listen.json`, `listen.png` and `run.json` (every setting plus the repo commit). Rerunning with the same voice, lyrics and seed reproduces the run. Overrides: `--clean`, `--start auto|SEC`, `--boost-at auto|none|SEC`, `--boost DB`, `--mix-gain DB`, `--steps N`, `--no-intro-line`, `--no-listen`.
 
 - **Write lyrics first** (`/music compose`): short lines, few words and a repeated hook are sung far more clearly than dense verses.
-- **It is slow on Apple Silicon**: ~17 min generation + ~5 min cleaning + ~2 min report. Run it in the background, tell the user up front, and show the progress dashboard if the user has asked for one.
+- **It is slow on Apple Silicon**: ~17 min generation + ~2 min report, plus ~5 min if the take is cleaned. Run it in the background, tell the user up front, and show the progress dashboard if the user has asked for one.
 - **Report the listening facts**, then ask the user how it sounds.
 
 ### Voice profiles
@@ -143,7 +145,7 @@ A voice the user likes can be kept as a profile: `<voices_dir>/<name>/profile.js
 ```json
 {"name": "Aria", "version": 1,
  "lego": {"caption": "...", "seed": 20261016, "inference_steps": 50, "track": "vocals"},
- "post": {"clean": true, "mix_gain_db": 0.0, "boost_db": 5.0},
+ "post": {"clean": false, "mix_gain_db": 0.0, "boost_db": 5.0},
  "lyrics": {"intro_line": "Ooh, ooh"}}
 ```
 
