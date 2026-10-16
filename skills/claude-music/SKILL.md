@@ -60,7 +60,7 @@ When the user provides a specific command, load the matching sub-skill:
 - `/music random` or intent is quick generation/surprise me/random song → Read `skills/claude-music-random/SKILL.md`
 - `/music library` or intent is list songs/browse output/manage music → Read `skills/claude-music-library/SKILL.md`
 - `/music web` or intent is dashboard/browser app/web UI/visual player → Read `skills/claude-music-web/SKILL.md`
-- `/music lora` or intent is train/fine-tune/LoRA/custom style → Read `skills/claude-music-lora/SKILL.md`
+- `/music lora` or intent is train/fine-tune/LoRA/custom style, or train/lock in a named voice → Read `skills/claude-music-lora/SKILL.md` (a named voice from one clean vocal: "Training a Named Voice", `music_train_voice.sh`)
 - `/music vocals` or intent is add vocals/singing/lyrics to an existing instrumental **without changing it** → see "Singing Over an Instrumental (vocal flow)" below. Do not use cover for this: cover regenerates the whole song.
 - `/music lego` or intent is add an instrument (or a vocal with hand-picked settings) on top of an existing track → see "Adding a Layer to an Existing Track" below.
 - `/music setup` → Run `bash ~/.claude/skills/claude-music/scripts/setup.sh`
@@ -149,7 +149,7 @@ A voice the user likes can be kept as a profile: `<voices_dir>/<name>/profile.js
 
 **Trained voice adapter**: `lego.lora` (path relative to the profile folder, e.g. `"adapter"` holding `lokr_weights.safetensors`) plus `lora_scale` locks the voice far better than caption + seed; start the caption with the adapter's trigger word (e.g. "Aria, ..."). Engine flags: `--lora PATH --lora-scale 0-1`. On Apple Silicon only LoKr adapters work: the engine merges them into the DiT weights and builds the MLX decoder once afterwards (`merge_lokr_into_mlx`), so memory matches a normal run. Never fall back to the PyTorch decoder on a 16 GB Mac: it went past 18 GB and froze the machine. The melody differs per take by design; the adapter carries the timbre.
 
-Without an adapter, be upfront that a profile gives a similar voice, not the identical one: a new song, key or lyrics changes it. Keep the clean stems of takes the user likes in `<voices_dir>/<name>/samples/`; they are the dataset for training the voice later (`/music lora`).
+Without an adapter, be upfront that a profile gives a similar voice, not the identical one: a new song, key or lyrics changes it. Keep the clean stems of takes the user likes in `<voices_dir>/<name>/samples/`; they are the dataset for training the voice later: `music_train_voice.sh <name> <clean-vocal> --lyrics <timed> --caption "..."` cuts clips, trains a LoKr (hours: run it in the background) and installs it as `adapter/` in the profile (see `/music lora`).
 
 ## Adding a Layer to an Existing Track (lego)
 
