@@ -1,0 +1,19 @@
+{
+  "name": "Example",
+  "version": 1,
+  "description": "Copy to <voices_dir>/<name>/profile.json (default ~/Music/claude-music-voices/<name>/) and use with --voice <name>. Every key below is optional; explicit CLI flags win.",
+  "lego": {
+    "caption": "melodic techno vocal, female singer, breathy airy voice, emotional and intimate, crisp clear diction, long sustained notes, clear English lyrics, lead vocal upfront with reverb",
+    "seed": 20261016,
+    "inference_steps": 50,
+    "track": "vocals"
+  },
+  "post": {
+    "clean": true,
+    "mix_gain_db": 0.0,
+    "boost_db": 5.0
+  },
+  "lyrics": {
+    "intro_line": "Ooh, ooh"
+  }
+}

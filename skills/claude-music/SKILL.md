@@ -32,6 +32,7 @@ allowed-tools:
 | `/music repaint` | Edit a specific section of a song |
 | `/music extract` | Separate tracks/stems (base model only) |
 | `/music lego` | Add instrument layer (base model only) |
+| `/music vocals` | Sing over an existing instrumental, end to end (analysis, vocal, clean, mix, listen) |
 | `/music complete` | Continue/extend audio (base model only) |
 | `/music compose` | Songwriting: craft caption + lyrics + params |
 | `/music analyze` | BPM, key, loudness, duration analysis |
@@ -60,7 +61,8 @@ When the user provides a specific command, load the matching sub-skill:
 - `/music library` or intent is list songs/browse output/manage music → Read `skills/claude-music-library/SKILL.md`
 - `/music web` or intent is dashboard/browser app/web UI/visual player → Read `skills/claude-music-web/SKILL.md`
 - `/music lora` or intent is train/fine-tune/LoRA/custom style → Read `skills/claude-music-lora/SKILL.md`
-- `/music lego` or intent is add vocals/lyrics/an instrument on top of an existing track **without changing it** → see "Adding a Layer to an Existing Track" below. Do not use cover for this: cover regenerates the whole song.
+- `/music vocals` or intent is add vocals/singing/lyrics to an existing instrumental **without changing it** → see "Singing Over an Instrumental (vocal flow)" below. Do not use cover for this: cover regenerates the whole song.
+- `/music lego` or intent is add an instrument (or a vocal with hand-picked settings) on top of an existing track → see "Adding a Layer to an Existing Track" below.
 - `/music setup` → Run `bash ~/.claude/skills/claude-music/scripts/setup.sh`
 
 ### Interactive Mode
@@ -109,10 +111,50 @@ After any generation:
 - **Config**: `~/.claude/skills/claude-music/config.json`
 - **Output**: `~/Music/claude-music-output/`
 
+## Singing Over an Instrumental (vocal flow)
+
+The default for "put vocals on my song". One command runs the whole flow, the
+same way every time, with the original left untouched:
+
+```bash
+bash ~/.claude/skills/claude-music/scripts/music_vocals.sh "$SRC" \
+  --lyrics lyrics.txt --voice aria
+# or without a voice profile:
+bash ~/.claude/skills/claude-music/scripts/music_vocals.sh "$SRC" \
+  --lyrics lyrics.txt --caption "warm male baritone, clear diction" --seed 7
+```
+
+1. **Structure** (`music_structure.sh`): bpm, key, beat entry (`first_beat_sec`), drop (`drop_sec`, the largest rise onto the loud plateau).
+2. **Vocal layer** (`music_engine.sh lego --track vocals`) from the beat entry. When it starts mid-song, the voice profile's throwaway `[Intro]` line ("Ooh, ooh") is prepended; without it the model tends to drop the first lyric line.
+3. **Clean** (`--clean` → `music_clean.sh`): the lego layer carries quiet backing and extra drums. Demucs `htdemucs_ft` (two stems, `--shifts 0`, pinned versions, CPU on Apple Silicon) keeps the voice, then ffmpeg `adeclick` removes faint clicks. ~3-8 min.
+4. **Mix** (`--mix`): the clean stem over the original; base level `--mix-gain`, lifted by `--boost` dB (default 5) from the drop with a 0.5 s ramp, so the vocal holds up against the full-energy part.
+5. **Listening report** on the clean stem (see below).
+
+Each run gets its own folder `<output_dir>/<song>-vocals_<timestamp>/` with `lyrics.txt` (as sung, intro line included), `structure.json`, `engine.json`, `listen.json`, `listen.png` and `run.json` (every setting plus the repo commit). Rerunning with the same voice, lyrics and seed reproduces the run. Overrides: `--start auto|SEC`, `--boost-at auto|none|SEC`, `--boost DB`, `--mix-gain DB`, `--steps N`, `--no-intro-line`, `--no-listen`.
+
+- **Write lyrics first** (`/music compose`): short lines, few words and a repeated hook are sung far more clearly than dense verses.
+- **It is slow on Apple Silicon**: ~17 min generation + ~5 min cleaning + ~2 min report. Run it in the background, tell the user up front, and show the progress dashboard if the user has asked for one.
+- **Report the listening facts**, then ask the user how it sounds.
+
+### Voice profiles
+
+A voice the user likes can be kept as a profile: `<voices_dir>/<name>/profile.json` (`voices_dir` in config.json, default `~/Music/claude-music-voices`). `--voice <name>` (on `music_vocals.sh` and `lego`) fills caption, seed, steps, track and post-processing the user left unset; explicit flags always win. Example: `examples/voices/profile.example.json`.
+
+```json
+{"name": "Aria", "version": 1,
+ "lego": {"caption": "...", "seed": 20261016, "inference_steps": 50, "track": "vocals"},
+ "post": {"clean": true, "mix_gain_db": 0.0, "boost_db": 5.0},
+ "lyrics": {"intro_line": "Ooh, ooh"}}
+```
+
+**Trained voice adapter**: `lego.lora` (path relative to the profile folder, e.g. `"adapter"` holding `lokr_weights.safetensors`) plus `lora_scale` locks the voice far better than caption + seed; start the caption with the adapter's trigger word (e.g. "Aria, ..."). Engine flags: `--lora PATH --lora-scale 0-1`. On Apple Silicon only LoKr adapters work: the engine merges them into the DiT weights and builds the MLX decoder once afterwards (`merge_lokr_into_mlx`), so memory matches a normal run. Never fall back to the PyTorch decoder on a 16 GB Mac: it went past 18 GB and froze the machine. The melody differs per take by design; the adapter carries the timbre.
+
+Without an adapter, be upfront that a profile gives a similar voice, not the identical one: a new song, key or lyrics changes it. Keep the clean stems of takes the user likes in `<voices_dir>/<name>/samples/`; they are the dataset for training the voice later (`/music lora`).
+
 ## Adding a Layer to an Existing Track (lego)
 
-Use when the user wants singing, lyrics or an instrument added to a song they
-already have, with the original left intact.
+Use for instruments, or for a vocal when you need settings the vocal flow does
+not expose. For "sing over my song", use the vocal flow above.
 
 ```bash
 bash ~/.claude/skills/claude-music/scripts/music_engine.sh --quality standard --progress lego \
@@ -126,7 +168,8 @@ bash ~/.claude/skills/claude-music/scripts/music_engine.sh --quality standard --
 - **`--track`** is one of vocals, backing_vocals, drums, bass, guitar, keyboard, percussion, strings, synth, fx, brass, woodwinds. Without it the model guesses which layer to add.
 - **`--start` / `--end`** (seconds) limit where the layer plays, e.g. `--start 29.8` to bring vocals in after a 16-bar intro at 129 BPM. Snap them to bar lines: one bar is `240 / bpm` seconds in 4/4. Outside that range the layer file contains the source audio, not silence; `--mix` mutes it there, and a manual mix must do the same.
 - **Listen afterwards**: run `music_listen.sh` on the layer (next section) and report what it finds.
-- **The output is the new layer alone**, not the full song. `--mix` also writes `<name>_mix.<ext>` (source + layer, limiter on top) and reports it as `mix_path`. Rebalance with `--mix-gain <dB>` or by re-mixing the stem with ffmpeg; that needs no new generation.
+- **The output is the new layer alone**, not the full song, and it carries backing bleed. `--clean` writes `<name>_clean.flac` (Demucs + declick) and reports it as `clean_path`. `--mix` also writes `<name>_mix.<ext>` (source + layer, the clean stem when `--clean`, limiter on top) and reports it as `mix_path`. Rebalance with `--mix-gain <dB>`, lift from a point on with `--mix-boost-at SEC --mix-boost DB`, or re-mix the stem with ffmpeg; that needs no new generation.
+- **`--voice <name>`** applies a voice profile (see above).
 - **Needs the base model**: `cd <ace_step_dir> && uv run acestep-download --model acestep-v15-base --skip-main` (~4.8 GB). `--quality standard` keeps the LM unloaded, which matters on 16 GB machines; the engine still switches to the base model and its step/guidance settings.
 - **It is slow**: about 15 s per step for a 3-minute track on Apple Silicon (16 GB), so ~19 min at 50 steps. Run it in the background and tell the user up front. The engine raises ACE-Step's 600 s generation timeout to an hour (`ACESTEP_GENERATION_TIMEOUT` overrides).
 - **Progress**: with `--progress`, stderr carries `{"event": "step", "step": 11, "total": 50, "eta_sec": 547}` lines from the real diffusion loop. Report those.
