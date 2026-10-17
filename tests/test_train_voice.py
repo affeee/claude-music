@@ -3,6 +3,8 @@ checkpoint choice and the profile update. Stdlib only, no ACE-Step or ffmpeg."""
 import json
 import math
 
+import pytest
+
 import music_train_voice as tv
 
 
@@ -107,6 +109,22 @@ def test_build_dataset_matches_side_step_format():
     assert s["caption"] == "female singer"   # Side-Step prepends the tag itself
     assert (s["bpm"], s["keyscale"], s["duration"], s["is_instrumental"], s["labeled"]) == (
         129, "C minor", 20.0, False, True)
+
+
+def test_build_dataset_extra_take_has_no_bpm_key():
+    clips = [{"path": "/v/aria_01.wav", "start": 0.0, "end": 20.0, "lyrics": "x"},
+             {"path": "/v/aria_02.wav", "start": 0.0, "end": 15.0, "lyrics": "y", "bpm": None, "key": ""}]
+    s1, s2 = tv.build_dataset("r", "Aria", "c", clips, bpm=129, key="C minor")["samples"]
+    assert (s1["bpm"], s1["keyscale"]) == (129, "C minor")
+    assert (s2["bpm"], s2["keyscale"], s2["duration"]) == (None, "", 15.0)
+
+
+def test_parse_extra_sources():
+    assert tv.parse_extra_sources(None) == []
+    assert tv.parse_extra_sources([["a.flac"], ["b.flac", "b.json"]]) == [
+        ("a.flac", None), ("b.flac", "b.json")]
+    with pytest.raises(ValueError):
+        tv.parse_extra_sources([["a", "b", "c"]])
 
 
 def test_strip_tag():

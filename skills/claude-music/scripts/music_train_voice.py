@@ -256,8 +256,21 @@ def select_clips(windows, lines=None, levels=None, min_active=MIN_ACTIVE):
     return clips
 
 
+def parse_extra_sources(values):
+    """--add values -> [(vocal, lyrics or None)]: each --add is VOCAL [LYRICS]."""
+    out = []
+    for v in values or []:
+        if not 1 <= len(v) <= 2:
+            raise ValueError(f"--add takes VOCAL [LYRICS], got {len(v)} values")
+        out.append((v[0], v[1] if len(v) == 2 else None))
+    return out
+
+
 def build_dataset(run_name, tag, caption, clips, bpm=None, key="", language="en"):
-    """Side-Step dataset JSON. Preprocessing prepends custom_tag to each caption."""
+    """Side-Step dataset JSON. Preprocessing prepends custom_tag to each caption.
+
+    A clip's own "bpm"/"key" (an --add source has none) win over the run's.
+    """
     return {
         "metadata": {"name": run_name, "custom_tag": tag, "tag_position": "prepend",
                      "genre_ratio": 0},
@@ -267,8 +280,8 @@ def build_dataset(run_name, tag, caption, clips, bpm=None, key="", language="en"
             "caption": caption,
             "lyrics": c["lyrics"],
             "genre": "",
-            "bpm": bpm,
-            "keyscale": key or "",
+            "bpm": c.get("bpm", bpm),
+            "keyscale": c.get("key", key) or "",
             "timesignature": "4",
             "duration": round(c["end"] - c["start"], 3),
             "is_instrumental": False,
@@ -458,6 +471,9 @@ def main():
     p.add_argument("name", help="Voice name (a-z, 0-9, -), e.g. aria")
     p.add_argument("vocal", nargs="?", help="Clean, isolated vocal (FLAC/WAV), ideally 1-4 min")
     p.add_argument("--lyrics", help="Timed lyrics: listen report JSON, segment JSON or LRC")
+    p.add_argument("--add", nargs="+", action="append", metavar="VOCAL [LYRICS]",
+                   help="Another clean take of the same voice, with optional timed lyrics "
+                        "(repeatable). Its clips get no bpm/key")
     p.add_argument("--caption", help="Voice description without the trigger word "
                                      "(default: the voice profile's lego.caption)")
     p.add_argument("--tag", help="Trigger word (default: the name capitalized, e.g. Aria)")
@@ -470,6 +486,8 @@ def main():
     p.add_argument("--clip-sec", type=float, default=CLIP_SEC)
     p.add_argument("--hop-sec", type=float, default=HOP_SEC)
     p.add_argument("--dry-run", action="store_true", help="Stop after writing clips and dataset.json")
+    p.add_argument("--no-install", action="store_true",
+                   help="Train only; pick and install a checkpoint later with --install RUN --epoch N")
     p.add_argument("--install", metavar="RUN",
                    help="Skip training: install a checkpoint from an earlier run of this voice")
     args = p.parse_args()
@@ -515,14 +533,28 @@ def main():
         fail("no caption: pass --caption 'female singer, breathy airy voice, ...' "
              "(describe the voice; the trigger word is added for you)")
 
-    lines = None
-    if args.lyrics:
-        try:
-            lines = parse_timed_lyrics(Path(args.lyrics).expanduser().read_text())
-        except OSError as e:
-            fail(f"cannot read lyrics: {e}")
-        if lines is None:
-            log("Lyrics have no timing: clips get [Verse] tags only, chosen by energy")
+    try:
+        extras = parse_extra_sources(args.add)
+    except ValueError as e:
+        fail(str(e))
+    sources = [(src, args.lyrics)]
+    for vocal, lyr in extras:
+        path = Path(vocal).expanduser().resolve()
+        if not path.is_file():
+            fail(f"vocal not found: {path}")
+        sources.append((path, lyr))
+
+    timed = []
+    for path, lyr in sources:
+        lines = None
+        if lyr:
+            try:
+                lines = parse_timed_lyrics(Path(lyr).expanduser().read_text())
+            except OSError as e:
+                fail(f"cannot read lyrics: {e}")
+            if lines is None:
+                log(f"Lyrics for {path.name} have no timing: [Verse] tags only, chosen by energy")
+        timed.append(lines)
 
     run = f"{name}-{datetime.now():%Y%m%d-%H%M%S}"
     run_dir = voice_dir / "training" / run
@@ -533,21 +565,36 @@ def main():
 
     # 1. Clips
     stage("clips")
-    duration = probe_duration(src)
-    if not duration:
-        fail(f"cannot read the duration of {src}", run_dir=str(run_dir))
-    windows = clip_windows(duration, args.clip_sec, args.hop_sec)
-    levels = decode_levels(src) if lines is None else None
-    clips = select_clips(windows, lines=lines, levels=levels)
-    if not clips:
-        fail("no window holds sung lines; is the vocal silent or the lyrics timing off?",
-             run_dir=str(run_dir), windows=len(windows))
+    clips, n_windows, duration, extra_info = [], 0, 0.0, []
+    for k, ((path, _), lines) in enumerate(zip(sources, timed)):
+        dur = probe_duration(path)
+        if not dur:
+            fail(f"cannot read the duration of {path}", run_dir=str(run_dir))
+        windows = clip_windows(dur, args.clip_sec, args.hop_sec)
+        levels = decode_levels(path) if lines is None else None
+        picked = select_clips(windows, lines=lines, levels=levels)
+        if not picked:
+            fail(f"no window of {path.name} holds sung lines; is the vocal silent or the "
+                 "lyrics timing off?", run_dir=str(run_dir), windows=len(windows))
+        for clip in picked:
+            clip["src"] = path
+            if k:  # an --add take: its song's bpm/key are not the run's
+                clip["bpm"], clip["key"] = None, ""
+        clips += picked
+        n_windows += len(windows)
+        if k:
+            extra_info.append({"source": str(path), "source_sec": round(dur, 2), "clips": len(picked),
+                               "timed_lyrics": lines is not None})
+        else:
+            duration = dur
+        log(f"{path.name}: {len(picked)} clips of {len(windows)} windows ({dur:.1f} s)")
     for i, clip in enumerate(clips, 1):
         clip["path"] = clips_dir / f"{name}_{i:02d}.wav"
-        ok, err = cut_clip(src, clip["start"], clip["end"] - clip["start"], clip["path"])
+        ok, err = cut_clip(clip["src"], clip["start"], clip["end"] - clip["start"], clip["path"])
         if not ok:
             fail(f"ffmpeg could not cut clip {i}: {err}", run_dir=str(run_dir))
-    log(f"{len(clips)} clips of {len(windows)} windows ({duration:.1f} s source)")
+    lines = timed[0]
+    log(f"{len(clips)} clips in all")
 
     # 2. Dataset
     stage("dataset", clips=len(clips))
@@ -573,7 +620,8 @@ def main():
                              TRAIN_FLAGS)
     manifest = {
         "run": run, "voice": name, "tag": tag, "caption": caption, "source": str(src),
-        "source_sec": round(duration, 2), "clips": len(clips), "clip_sec": args.clip_sec,
+        "source_sec": round(duration, 2), "extra_sources": extra_info, "clips": len(clips),
+        "clip_sec": args.clip_sec,
         "hop_sec": args.hop_sec, "timed_lyrics": lines is not None, "bpm": args.bpm, "key": args.key,
         "language": args.language, "epochs": args.epochs, "save_every": args.save_every,
         "ace_step_dir": str(ace) if ace else None, "tensors_dir": str(tensors_dir) if ace else None,
@@ -583,7 +631,7 @@ def main():
     manifest_path = run_dir / "run.json"
     manifest_path.write_text(json.dumps(manifest, indent=2))
     summary = {"success": True, "voice": name, "tag": tag, "run": run, "run_dir": str(run_dir),
-               "dataset": str(dataset_path), "clips": len(clips), "windows": len(windows),
+               "dataset": str(dataset_path), "clips": len(clips), "windows": n_windows,
                "timed_lyrics": lines is not None}
 
     if args.dry_run:
@@ -618,6 +666,15 @@ def main():
              log=str(run_dir / "train.log"), run_dir=str(run_dir))
     manifest["finished"] = datetime.now().isoformat(timespec="seconds")
     manifest_path.write_text(json.dumps(manifest, indent=2))
+
+    if args.no_install:
+        ck_root = output_dir / "checkpoints"
+        checkpoints = list_checkpoints(os.listdir(ck_root)) if ck_root.is_dir() else []
+        stage("done")
+        print(json.dumps({**summary, "installed": False, "checkpoints": checkpoints,
+                          "install_cmd": f"music_train_voice.sh {name} --install {run} --epoch N",
+                          "elapsed_sec": round(time.time() - t0, 1)}, indent=2))
+        return
 
     # 5. Install
     chosen, checkpoints, result = finish_install(voice_dir, run_dir, manifest, args.epoch)
