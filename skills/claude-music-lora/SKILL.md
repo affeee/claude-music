@@ -30,9 +30,16 @@ bash ~/.claude/skills/claude-music/scripts/music_train_voice.sh <name> <clean-vo
 # check the clips and dataset first (seconds, no model load):
 bash ~/.claude/skills/claude-music/scripts/music_train_voice.sh <name> <clean-vocal.flac> --caption "..." --dry-run
 
+# retrain on the first take plus approved new takes (bootstrapping), and keep the
+# current adapter until the user has picked a checkpoint by ear:
+bash ~/.claude/skills/claude-music/scripts/music_train_voice.sh <name> take1.flac --lyrics take1.json \
+  --add t2_clean.flac t2.json --add t4_clean.flac t4.json --epochs 60 --no-install
+
 # install another checkpoint from an earlier run after listening:
 bash ~/.claude/skills/claude-music/scripts/music_train_voice.sh <name> --install <run> --epoch 70
 ```
+
+Aria v3 (2026-10-17) came from this: take 1 plus four approved 30 s takes (31 clips, 60 epochs, about 5.5 min per epoch on the M1). Pitch wobble (p90 cents of frame-to-frame jitter / deviation from a 150 ms median) fell from 14/18 with v2 to 8/12 at epoch 30, against 6/10 for take 1. Changing the caption or `lora_scale` barely moved it, so more approved takes is the lever. Correct Whisper's timed lyrics by hand before training on them: it mishears generated vocals.
 
 What it does, in order:
 
@@ -40,9 +47,9 @@ What it does, in order:
 2. **Dataset**: Side-Step JSON with `custom_tag` = the trigger word (default: the name capitalized), `tag_position` prepend, `genre_ratio` 0, per-clip lyrics. Captions are stored without the tag; Side-Step prepends it.
 3. **Preprocess** with `--precision fp32`. fp16 on MPS put NaN into `encoder_hidden_states`, and the loss was NaN.
 4. **Train**: LoKr dim 16 / alpha 32, lr 3e-4, Adafactor, base model, fp32, batch 1, `--num-workers 0`, `--offload-encoder`, `--gradient-checkpointing`, a checkpoint every 10 epochs, 80 epochs, `PYTHONUNBUFFERED=1`.
-5. **Install**: the chosen checkpoint (default: lowest loss; `--epoch N` to pick) goes to `<voices_dir>/<name>/adapter/lokr_weights.safetensors`, and `profile.json` gets `lego.lora: "adapter"` and a caption starting with "<Tag>, ...". The previous adapter (`adapter/previous/`) and profile (`profile.<timestamp>.json`) are kept.
+5. **Install** (skipped with `--no-install`): the chosen checkpoint (default: lowest loss; `--epoch N` to pick) goes to `<voices_dir>/<name>/adapter/lokr_weights.safetensors`, and `profile.json` gets `lego.lora: "adapter"` and a caption starting with "<Tag>, ...". The previous adapter (`adapter/previous/`) and profile (`profile.<timestamp>.json`) are kept.
 
-`--lyrics` takes timed lyrics: a listening report from `music_listen.sh` (its `transcript.segments`), a JSON list of `{start, end, text}`, or LRC (`[mm:ss.xx] line`; bare `[Chorus]` lines set the section). Untimed lyrics or none give `[Verse]` tags only. `--caption` defaults to the voice profile's `lego.caption` when the voice already has one.
+`--lyrics` takes timed lyrics: a listening report from `music_listen.sh` (its `transcript.segments`), a JSON list of `{start, end, text}`, or LRC (`[mm:ss.xx] line`; bare `[Chorus]` lines set the section). Untimed lyrics or none give `[Verse]` tags only. Each `--add VOCAL [LYRICS]` is another clean take of the same voice, cut the same way; its clips get no bpm/key, since they come from other songs. `--caption` defaults to the voice profile's `lego.caption` when the voice already has one.
 
 Files: clips, `dataset.json`, `preprocess.log`, `train.log` and `run.json` (settings and the exact commands) in `<voices_dir>/<name>/training/<run>/`. Side-Step only accepts paths inside the ACE-Step dir, so tensors go to `<ace_step_dir>/datasets/<name>/<run>/` and checkpoints to `<ace_step_dir>/lora_output/<name>/<run>/checkpoints/epoch_N_loss_L/`. It runs with cwd = `ace_step_dir` through `scripts/sidestep_runner.py`, which patches three things without touching ACE-Step: `torchaudio.load` → soundfile (torchcodec cannot load Homebrew FFmpeg 9), trainable params cast to fp32 at `Fabric.setup` (the GradScaler refuses fp16 gradients), and `error_if_nonfinite=False` on `Fabric.clip_gradients` (the first scaled steps overflow).
 
